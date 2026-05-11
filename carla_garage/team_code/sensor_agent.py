@@ -280,7 +280,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
                                   interpolation=cv2.INTER_LINEAR)
       heatmap = cv2.applyColorMap(attention_uint8, cv2.COLORMAP_JET)
       rgb_bgr = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
-      overlay = cv2.addWeighted(rgb_bgr, 0.55, heatmap, 0.45, 0)
+      overlay = cv2.addWeighted(rgb_bgr, 0.7, heatmap, 0.3, 0)
       cv2.imwrite(str(overlay_path / f'{frame_id}.png'), overlay)
 
     metadata = {
