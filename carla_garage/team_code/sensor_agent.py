@@ -610,11 +610,13 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     result['speed'] = torch.FloatTensor([speed]).to(self.device, dtype=torch.float32)
 
     if self.save_path is not None:
-      pass
       waypoint_route = self._waypoint_planner.run_step(np.append(result['gps'], gps_pos[2]))
       waypoint_route = extrapolate_waypoint_route(waypoint_route, self.config.route_points)
       route = np.array([[node[0][0], node[0][1]] for node in waypoint_route])[:self.config.route_points]
-      self.lon_logger.log_step(route)
+      
+      # add self.control for logging
+      # it's like control -> observation results logging, not observation -> control
+      self.lon_logger.log_step(route, self.control)
 
     return result
 
@@ -825,9 +827,10 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       else:
         prob_target_speed = pred_target_speed
 
-      # 시각화
+      model_results_path = os.path.join(self.save_path, "model_results")
+      os.makedirs(model_results_path, exist_ok=True)
       self.nets[0].visualize_model(
-          self.save_path,
+          model_results_path,
           self.step,
           tick_data['rgb'],
           lidar_bev,
