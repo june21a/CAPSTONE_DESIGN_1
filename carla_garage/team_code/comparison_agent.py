@@ -204,7 +204,7 @@ class ComparisonAgent(SensorAgent):
   @staticmethod
   def _average_precision(recalls, precisions):
     if len(recalls) == 0:
-      return None
+      return 0.0
 
     recalls = np.concatenate(([0.0], recalls, [1.0]))
     precisions = np.concatenate(([0.0], precisions, [0.0]))
