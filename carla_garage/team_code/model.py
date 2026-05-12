@@ -281,9 +281,17 @@ class LidarCenterNet(nn.Module):
     if self.config.tp_attention:
       nn.init.uniform_(self.tp_pos_embed)
 
+  @staticmethod
+  def _feature_grid_to_attention_map(feature_grid):
+    if feature_grid is None or feature_grid.ndim != 4:
+      return None
+    return feature_grid.detach().abs().mean(dim=1)
+
   def forward(self, rgb, lidar_bev, target_point, ego_vel, command, target_point_next=None):
     bs = rgb.shape[0]
     self.latest_attention_map = None
+    self.latest_rgb_attention_map = None
+    self.latest_lidar_attention_map = None
     if self.config.two_tp_input:
       target_point = torch.cat((target_point, target_point_next), axis=1)
 
@@ -415,6 +423,11 @@ class LidarCenterNet(nn.Module):
     pred_bounding_box = None
     if self.config.detect_boxes:
       pred_bounding_box = self.head(bev_feature_grid)
+
+    self.latest_rgb_attention_map = self._feature_grid_to_attention_map(image_feature_grid)
+    if self.config.backbone != 'aim':
+      self.latest_lidar_attention_map = self._feature_grid_to_attention_map(bev_feature_grid)
+    self.latest_attention_map = self.latest_rgb_attention_map
 
     return pred_wp, pred_target_speed, pred_checkpoint, pred_semantic, pred_bev_semantic, pred_depth, \
       pred_bounding_box, attention_weights, pred_wp_1, selected_path

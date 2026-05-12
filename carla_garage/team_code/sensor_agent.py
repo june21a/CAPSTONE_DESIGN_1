@@ -249,7 +249,45 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       attention_map = attention_map / max_value
     return attention_map.astype(np.float32)
 
-  def _save_sensor_attention_data(self, tick_data, lidar_bev, attention_map, control, pred_target_speed_scalar):
+  @staticmethod
+  def _lidar_bev_to_image(lidar_bev):
+    lidar_map = lidar_bev[0].detach().float().cpu().numpy()
+    if lidar_map.ndim == 3:
+      lidar_map = np.max(lidar_map, axis=0)
+
+    lidar_map = lidar_map - np.min(lidar_map)
+    max_value = np.max(lidar_map)
+    if max_value > 1e-6:
+      lidar_map = lidar_map / max_value
+
+    lidar_uint8 = (255 - lidar_map * 255).astype(np.uint8)
+    lidar_image = np.stack([lidar_uint8, lidar_uint8, lidar_uint8], axis=-1)
+    return np.ascontiguousarray(lidar_image)
+
+  @staticmethod
+  def _draw_attention_on_lidar_bev(lidar_bev, normalized_attention, alpha=0.35, scale_factor=4):
+    lidar_image = SensorAgent._lidar_bev_to_image(lidar_bev)
+    attention_uint8 = (normalized_attention * 255).astype(np.uint8)
+    attention_uint8 = cv2.resize(attention_uint8,
+                                 dsize=(lidar_image.shape[1], lidar_image.shape[0]),
+                                 interpolation=cv2.INTER_LINEAR)
+    heatmap = cv2.applyColorMap(attention_uint8, cv2.COLORMAP_JET)
+    overlay = cv2.addWeighted(lidar_image, 1.0 - alpha, heatmap, alpha, 0)
+
+    if scale_factor > 1:
+      lidar_image = cv2.resize(lidar_image,
+                               dsize=(lidar_image.shape[1] * scale_factor, lidar_image.shape[0] * scale_factor),
+                               interpolation=cv2.INTER_NEAREST)
+      overlay = cv2.resize(overlay,
+                           dsize=(overlay.shape[1] * scale_factor, overlay.shape[0] * scale_factor),
+                           interpolation=cv2.INTER_NEAREST)
+
+    lidar_image = np.rot90(lidar_image, k=1)
+    overlay = np.rot90(overlay, k=1)
+    return np.ascontiguousarray(lidar_image, dtype=np.uint8), np.ascontiguousarray(overlay, dtype=np.uint8)
+
+  def _save_sensor_attention_data(self, tick_data, lidar_bev, rgb_attention_map, lidar_attention_map, control,
+                                  pred_target_speed_scalar):
     if self.save_path is None or not self.collect_sensor_data or self.step % self.attention_save_freq != 0:
       return
 
@@ -258,8 +296,11 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     lidar_path = sensor_path / 'lidar'
     attention_path = sensor_path / 'attention'
     overlay_path = sensor_path / 'attention_overlay'
+    lidar_attention_map_path = sensor_path / 'lidar_attention'
+    lidar_attention_path = sensor_path / 'lidar_attention_overlay'
     metadata_path = sensor_path / 'metadata'
-    for path in (rgb_path, lidar_path, attention_path, overlay_path, metadata_path):
+    for path in (rgb_path, lidar_path, attention_path, overlay_path, lidar_attention_map_path, lidar_attention_path,
+                 metadata_path):
       path.mkdir(parents=True, exist_ok=True)
 
     frame_id = f'{self.step:04}'
@@ -270,11 +311,11 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       np.savez_compressed(lidar_path / f'{frame_id}_points.npz', lidar=tick_data['lidar'])
     np.savez_compressed(lidar_path / f'{frame_id}_bev.npz', lidar_bev=lidar_bev.detach().cpu().numpy())
 
-    if self.attention_visualization and attention_map is not None:
-      normalized_attention = self._normalize_map(attention_map)
-      np.savez_compressed(attention_path / f'{frame_id}.npz', attention=normalized_attention)
+    if self.attention_visualization and rgb_attention_map is not None:
+      normalized_rgb_attention = self._normalize_map(rgb_attention_map)
+      np.savez_compressed(attention_path / f'{frame_id}.npz', attention=normalized_rgb_attention)
 
-      attention_uint8 = (normalized_attention * 255).astype(np.uint8)
+      attention_uint8 = (normalized_rgb_attention * 255).astype(np.uint8)
       attention_uint8 = cv2.resize(attention_uint8,
                                   dsize=(rgb_image.shape[1], rgb_image.shape[0]),
                                   interpolation=cv2.INTER_LINEAR)
@@ -282,6 +323,14 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       rgb_bgr = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
       overlay = cv2.addWeighted(rgb_bgr, 0.7, heatmap, 0.3, 0)
       cv2.imwrite(str(overlay_path / f'{frame_id}.png'), overlay)
+
+    if self.attention_visualization and lidar_attention_map is not None:
+      normalized_lidar_attention = self._normalize_map(lidar_attention_map)
+      np.savez_compressed(lidar_attention_map_path / f'{frame_id}.npz', attention=normalized_lidar_attention)
+
+      lidar_image, lidar_attention_overlay = self._draw_attention_on_lidar_bev(lidar_bev, normalized_lidar_attention)
+      cv2.imwrite(str(lidar_attention_path / f'{frame_id}_bev.png'), lidar_image)
+      cv2.imwrite(str(lidar_attention_path / f'{frame_id}.png'), lidar_attention_overlay)
 
     metadata = {
         'step': self.step,
@@ -672,7 +721,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     pred_checkpoints = []
     bounding_boxes = []
     wp_selected = None
-    attention_maps = []
+    rgb_attention_maps = []
+    lidar_attention_maps = []
     for i in range(self.model_count):
       if self.config.backbone in ('transFuser', 'aim', 'bev_encoder'):
         pred_wp, \
@@ -691,9 +741,12 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
           target_point_next=tick_data['target_point_next'] if self.config.two_tp_input else None,
           ego_vel=velocity,
           command=tick_data['command'])
-        latest_attention_map = getattr(self.nets[i], 'latest_attention_map', None)
-        if latest_attention_map is not None:
-          attention_maps.append(latest_attention_map)
+        latest_rgb_attention_map = getattr(self.nets[i], 'latest_rgb_attention_map', None)
+        if latest_rgb_attention_map is not None:
+          rgb_attention_maps.append(latest_rgb_attention_map)
+        latest_lidar_attention_map = getattr(self.nets[i], 'latest_lidar_attention_map', None)
+        if latest_lidar_attention_map is not None:
+          lidar_attention_maps.append(latest_lidar_attention_map)
         # Only convert bounding boxes when they are used.
         if self.config.detect_boxes and (compute_debug_output or self.config.backbone in ('aim') or
                                          self.stop_sign_controller):
@@ -755,10 +808,15 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     else:
       pred_target_speed_scalar = None
 
-    if attention_maps:
-      attention_map = torch.stack(attention_maps, dim=0).mean(dim=0)
+    if rgb_attention_maps:
+      rgb_attention_map = torch.stack(rgb_attention_maps, dim=0).mean(dim=0)
     else:
-      attention_map = None
+      rgb_attention_map = None
+
+    if lidar_attention_maps:
+      lidar_attention_map = torch.stack(lidar_attention_maps, dim=0).mean(dim=0)
+    else:
+      lidar_attention_map = None
 
     # Visualize the output of the last model
     if compute_debug_output:
@@ -848,7 +906,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       brake = True
 
     control = carla.VehicleControl(steer=float(steer), throttle=float(throttle), brake=float(brake))
-    self._save_sensor_attention_data(tick_data, lidar_bev, attention_map, control, pred_target_speed_scalar)
+    self._save_sensor_attention_data(tick_data, lidar_bev, rgb_attention_map, lidar_attention_map, control,
+                                     pred_target_speed_scalar)
     self._save_vision_task_data(tick_data, lidar_bev, pred_semantic, pred_bev_semantic, pred_depth,
                                 bbs_vehicle_coordinate_system)
 
