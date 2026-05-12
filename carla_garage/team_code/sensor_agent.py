@@ -66,6 +66,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     self.nets = []
     self.config = None
     self.metric_info = {}
+    self.vision_task_paths = None
     self.collect_sensor_data = strtobool(os.environ.get('COLLECT_SENSOR_DATA', '0'))
     self.attention_visualization = strtobool(os.environ.get('ATTENTION_VIS', '1'))
     self.vision_task_visualization = strtobool(os.environ.get('VISION_TASK_VIS', '1'))
@@ -232,6 +233,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     else:
       self.save_path = None
 
+    self._init_vision_task_paths()
+
   @staticmethod
   def _tensor_rgb_to_numpy(rgb):
     rgb_image = rgb[0].permute(1, 2, 0).detach().cpu().numpy()
@@ -352,13 +355,15 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     if self.step % self.attention_save_freq != 0:
       return
 
-    vision_path = pathlib.Path(self.save_path) / 'sensor_data' / 'vision_tasks'
-    semantic_path = vision_path / 'semantic'
-    bev_semantic_path = vision_path / 'bev_semantic'
-    depth_path = vision_path / 'depth'
-    detection_path = vision_path / 'detection'
-    for path in (semantic_path, bev_semantic_path, depth_path, detection_path):
-      path.mkdir(parents=True, exist_ok=True)
+    if self.vision_task_paths is None:
+      self._init_vision_task_paths()
+      if self.vision_task_paths is None:
+        return
+
+    semantic_path = self.vision_task_paths['semantic']
+    bev_semantic_path = self.vision_task_paths['bev_semantic']
+    depth_path = self.vision_task_paths['depth']
+    detection_path = self.vision_task_paths['detection']
 
     frame_id = f'{self.step:04}'
     rgb_image = self._tensor_rgb_to_numpy(tick_data['rgb'])
@@ -427,6 +432,21 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         lidar_image = t_u.draw_box(lidar_image, box_image, color=color_box, pixel_per_meter=loc_pixels_per_meter)
       lidar_image = np.rot90(lidar_image, k=1)
       cv2.imwrite(str(detection_path / f'{frame_id}.png'), np.ascontiguousarray(lidar_image, dtype=np.uint8))
+
+  def _init_vision_task_paths(self):
+    self.vision_task_paths = None
+    if self.save_path is None or not self.collect_sensor_data or not self.vision_task_visualization:
+      return
+
+    vision_path = pathlib.Path(self.save_path) / 'sensor_data' / 'vision_tasks'
+    self.vision_task_paths = {
+        'semantic': vision_path / 'semantic',
+        'bev_semantic': vision_path / 'bev_semantic',
+        'depth': vision_path / 'depth',
+        'detection': vision_path / 'detection',
+    }
+    for path in self.vision_task_paths.values():
+      path.mkdir(parents=True, exist_ok=True)
 
   def _init(self):
     # The CARLA leaderboard does not expose the lat lon reference value of the GPS which make it impossible to use the

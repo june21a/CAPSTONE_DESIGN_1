@@ -37,11 +37,13 @@ class ComparisonAgent(SensorAgent):
 
   def setup(self, path_to_conf_file, route_index=None, traffic_manager=None):
     super().setup(path_to_conf_file, route_index, traffic_manager=traffic_manager)
+    self.vision_task_gt_paths = None
     if os.environ.get('COMPARISON_FORCE_DEBUG', '1') == '1':
       self.config.debug = True
     self.gt_bev_manager = None
     self.gt_stop_sign_criteria = None
     self.gt_vehicle = None
+    self._init_vision_task_gt_paths()
 
   def _init(self):
     super()._init()
@@ -287,13 +289,15 @@ class ComparisonAgent(SensorAgent):
       return
 
     frame_id = f'{self.step:04}'
-    gt_path = pathlib.Path(self.save_path) / 'sensor_data' / 'vision_tasks_gt'
-    semantic_path = gt_path / 'semantic'
-    bev_semantic_path = gt_path / 'bev_semantic'
-    depth_path = gt_path / 'depth'
-    metrics_path = gt_path / 'metrics'
-    for path in (semantic_path, bev_semantic_path, depth_path, metrics_path):
-      path.mkdir(parents=True, exist_ok=True)
+    if self.vision_task_gt_paths is None:
+      self._init_vision_task_gt_paths()
+      if self.vision_task_gt_paths is None:
+        return
+
+    semantic_path = self.vision_task_gt_paths['semantic']
+    bev_semantic_path = self.vision_task_gt_paths['bev_semantic']
+    depth_path = self.vision_task_gt_paths['depth']
+    metrics_path = self.vision_task_gt_paths['metrics']
 
     metrics = {}
 
@@ -366,3 +370,18 @@ class ComparisonAgent(SensorAgent):
     if metrics:
       with open(metrics_path / f'{frame_id}.json', 'w', encoding='utf-8') as outfile:
         json.dump(metrics, outfile, indent=2)
+
+  def _init_vision_task_gt_paths(self):
+    self.vision_task_gt_paths = None
+    if self.save_path is None or not self.collect_sensor_data or not self.vision_task_visualization:
+      return
+
+    gt_path = pathlib.Path(self.save_path) / 'sensor_data' / 'vision_tasks_gt'
+    self.vision_task_gt_paths = {
+        'semantic': gt_path / 'semantic',
+        'bev_semantic': gt_path / 'bev_semantic',
+        'depth': gt_path / 'depth',
+        'metrics': gt_path / 'metrics',
+    }
+    for path in self.vision_task_gt_paths.values():
+      path.mkdir(parents=True, exist_ok=True)
