@@ -15,8 +15,8 @@ export PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${SCENARIO_RUNNER_ROOT}:${LEADE
 CARLA_GARAGE_DIR="${CURRENT_DIR}/carla_garage"
 AGENT_CONFIG="./pretrained_models/all_towns"
 AGENT="./team_code/comparison_agent.py"
-ROUTES="./leaderboard/data/routes_validation.xml"
-SAVE_PATH_DIR="./results/routes_validation"
+ROUTES="./leaderboard/data/bench2drive220.xml"
+SAVE_PATH_DIR="./results/bench2drive220"
 CHECKPOINT="${SAVE_PATH_DIR}/debug_results.json"
 
 # ===== Environment Variables =====
