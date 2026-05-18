@@ -71,6 +71,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     self.attention_visualization = strtobool(os.environ.get('ATTENTION_VIS', '1'))
     self.vision_task_visualization = strtobool(os.environ.get('VISION_TASK_VIS', '1'))
     self.attention_save_freq = max(1, int(os.environ.get('ATTENTION_SAVE_FREQ', '1')))
+    self._ego_vehicle = None
+    self._world = None
     self.force_cpu = strtobool(os.environ.get('FORCE_CPU', '0'))
     if strtobool(os.environ.get('DISABLE_CUDNN', '0')):
       torch.backends.cudnn.enabled = False
@@ -268,6 +270,131 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     return np.ascontiguousarray(lidar_image)
 
   @staticmethod
+  def _bbox_corners_local(bounding_box):
+    extent = bounding_box.extent
+    location = bounding_box.location
+    corners = []
+    for x in (-extent.x, extent.x):
+      for y in (-extent.y, extent.y):
+        for z in (-extent.z, extent.z):
+          corners.append([location.x + x, location.y + y, location.z + z, 1.0])
+    return np.asarray(corners, dtype=np.float32)
+
+  @staticmethod
+  def _transform_points(transform_matrix, points):
+    transformed = np.asarray(transform_matrix, dtype=np.float32) @ points.T
+    return transformed.T[:, :3]
+
+  @staticmethod
+  def _project_world_points_to_image(points_world, world_to_camera, intrinsic_matrix):
+    points_h = np.concatenate([points_world, np.ones((points_world.shape[0], 1), dtype=np.float32)], axis=1)
+    points_camera = (np.asarray(world_to_camera, dtype=np.float32) @ points_h.T).T
+
+    # CARLA uses x-front, y-right, z-up; pinhole uses x-right, y-down, z-front.
+    pinhole_points = np.stack([points_camera[:, 1], -points_camera[:, 2], points_camera[:, 0]], axis=1)
+    depths = pinhole_points[:, 2]
+    valid = depths > 1e-3
+    if not np.any(valid):
+      return None, None
+
+    projected = (intrinsic_matrix @ pinhole_points[valid].T).T
+    projected[:, 0] /= projected[:, 2]
+    projected[:, 1] /= projected[:, 2]
+    return projected[:, :2], depths[valid]
+
+  def _get_camera_world_matrix(self):
+    if self._ego_vehicle is None or self._ego_vehicle.is_alive is False:
+      return None
+
+    ego_transform = self._ego_vehicle.get_transform()
+    camera_location = carla.Location(x=self.config.camera_pos[0],
+                                     y=self.config.camera_pos[1],
+                                     z=self.config.camera_pos[2])
+    camera_rotation = carla.Rotation(roll=self.config.camera_rot_0[0],
+                                     pitch=self.config.camera_rot_0[1],
+                                     yaw=self.config.camera_rot_0[2])
+    camera_transform = carla.Transform(camera_location, camera_rotation)
+    return np.asarray(ego_transform.get_matrix(), dtype=np.float32) @ np.asarray(camera_transform.get_matrix(),
+                                                                                 dtype=np.float32)
+
+  def _get_2d_bounding_boxes(self):
+    if self._world is None or self._ego_vehicle is None:
+      return []
+
+    camera_world_matrix = self._get_camera_world_matrix()
+    if camera_world_matrix is None:
+      return []
+
+    full_width = self.config.camera_width
+    full_height = self.config.camera_height
+    image_width = self.config.cropped_width if self.config.crop_image else full_width
+    image_height = self.config.cropped_height if self.config.crop_image else full_height
+    side_crop = (full_width - image_width) // 2 if self.config.crop_image else 0
+
+    intrinsic_matrix = t_u.calculate_intrinsic_matrix(fov=self.config.camera_fov, height=full_height, width=full_width)
+    world_to_camera = np.linalg.inv(camera_world_matrix)
+    ego_location = self._ego_vehicle.get_location()
+
+    boxes_2d = []
+    actors = self._world.get_actors()
+    actor_lists = (
+        ('car', actors.filter('*vehicle*')),
+        ('walker', actors.filter('*walker*')),
+        ('static', actors.filter('*static*')),
+    )
+
+    for actor_class, actor_list in actor_lists:
+      for actor in actor_list:
+        if actor.id == self._ego_vehicle.id or not hasattr(actor, 'bounding_box'):
+          continue
+        if actor.get_location().distance(ego_location) > self.config.bb_save_radius:
+          continue
+
+        corners_local = self._bbox_corners_local(actor.bounding_box)
+        corners_world = self._transform_points(actor.get_transform().get_matrix(), corners_local)
+        points_2d, depths = self._project_world_points_to_image(corners_world, world_to_camera, intrinsic_matrix)
+        if points_2d is None:
+          continue
+
+        points_2d[:, 0] -= side_crop
+        x_min = float(np.clip(np.min(points_2d[:, 0]), 0, image_width - 1))
+        y_min = float(np.clip(np.min(points_2d[:, 1]), 0, image_height - 1))
+        x_max = float(np.clip(np.max(points_2d[:, 0]), 0, image_width - 1))
+        y_max = float(np.clip(np.max(points_2d[:, 1]), 0, image_height - 1))
+
+        if x_max <= x_min or y_max <= y_min:
+          continue
+
+        boxes_2d.append({
+            'class': actor_class,
+            'id': int(actor.id),
+            'type_id': actor.type_id,
+            'box': [x_min, y_min, x_max, y_max],
+            'center': [float((x_min + x_max) * 0.5), float((y_min + y_max) * 0.5)],
+            'depth': float(np.min(depths)),
+            'distance': float(actor.get_location().distance(ego_location)),
+            'corners': points_2d.tolist(),
+        })
+
+    return boxes_2d
+
+  @staticmethod
+  def _draw_2d_boxes(rgb_image, boxes_2d):
+    image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+    color_by_class = {
+        'car': (0, 255, 0),
+        'walker': (0, 165, 255),
+        'static': (255, 0, 0),
+    }
+    for box in boxes_2d:
+      x_min, y_min, x_max, y_max = [int(round(value)) for value in box['box']]
+      color = color_by_class.get(box['class'], (255, 255, 255))
+      cv2.rectangle(image, (x_min, y_min), (x_max, y_max), color, 2)
+      cv2.putText(image, f"{box['class']}:{box['id']}", (x_min, max(0, y_min - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                  color, 1, cv2.LINE_AA)
+    return image
+
+  @staticmethod
   def _draw_attention_on_lidar_bev(lidar_bev, normalized_attention, alpha=0.35, scale_factor=4):
     lidar_image = SensorAgent._lidar_bev_to_image(lidar_bev)
     attention_uint8 = (normalized_attention * 255).astype(np.uint8)
@@ -301,9 +428,11 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     overlay_path = sensor_path / 'attention_overlay'
     lidar_attention_map_path = sensor_path / 'lidar_attention'
     lidar_attention_path = sensor_path / 'lidar_attention_overlay'
+    box_2d_path = sensor_path / '2d_box'
+    box_2d_overlay_path = sensor_path / '2d_box_overlay'
     metadata_path = sensor_path / 'metadata'
     for path in (rgb_path, lidar_path, attention_path, overlay_path, lidar_attention_map_path, lidar_attention_path,
-                 metadata_path):
+                 box_2d_path, box_2d_overlay_path, metadata_path):
       path.mkdir(parents=True, exist_ok=True)
 
     frame_id = f'{self.step:04}'
@@ -335,10 +464,17 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       cv2.imwrite(str(lidar_attention_path / f'{frame_id}_bev.png'), lidar_image)
       cv2.imwrite(str(lidar_attention_path / f'{frame_id}.png'), lidar_attention_overlay)
 
+    boxes_2d = tick_data.get('2d_box', [])
+    with open(box_2d_path / f'{frame_id}.json', 'w', encoding='utf-8') as outfile:
+      ujson.dump({'boxes': boxes_2d}, outfile, indent=2)
+    if boxes_2d:
+      cv2.imwrite(str(box_2d_overlay_path / f'{frame_id}.png'), self._draw_2d_boxes(rgb_image, boxes_2d))
+
     metadata = {
         'step': self.step,
         'speed': float(tick_data['speed'].detach().cpu().item()),
         'target_point': tick_data['target_point'].detach().cpu().numpy()[0].tolist(),
+        'num_2d_boxes': len(boxes_2d),
         'pred_target_speed_scalar': None if pred_target_speed_scalar is None else float(pred_target_speed_scalar),
         'control': {
             'steer': float(control.steer),
@@ -456,6 +592,15 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     # coordinates. The GPS plan is compared to the CARLA coordinate plan to estimate the reference point / scale
     # of the GPS. It seems to work reasonably well, so we use this workaround for now.
     try:
+      from srunner.scenariomanager.carla_data_provider import CarlaDataProvider  # pylint: disable=locally-disabled, import-outside-toplevel
+      self._ego_vehicle = CarlaDataProvider.get_hero_actor()
+      self._world = self._ego_vehicle.get_world() if self._ego_vehicle is not None else None
+    except Exception as e:
+      print(e, flush=True)
+      self._ego_vehicle = None
+      self._world = None
+
+    try:
       locx, locy = self._global_plan_world_coord[0][0].location.x, self._global_plan_world_coord[0][0].location.y
       lon, lat = self._global_plan[0][0]['lon'], self._global_plan[0][0]['lat']
       earth_radius_equa = 6378137.0  # Constant from CARLA leaderboard GPS simulation
@@ -489,7 +634,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
                                             self.config.route_planner_max_distance, self.lat_ref, self.lon_ref)
       self._waypoint_planner.set_route(self.dense_route, True)
 
-      vehicle = CarlaDataProvider.get_hero_actor()
+      vehicle = self._ego_vehicle
       self.lon_logger.ego_vehicle = vehicle
       self.lon_logger.world = vehicle.get_world()
 
@@ -628,6 +773,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       result['target_point_next'] = ego_target_point_next
 
     result['speed'] = torch.FloatTensor([speed]).to(self.device, dtype=torch.float32)
+    result['2d_box'] = self._get_2d_bounding_boxes()
 
     if self.save_path is not None:
       waypoint_route = self._waypoint_planner.run_step(np.append(result['gps'], gps_pos[2]))
