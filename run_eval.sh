@@ -18,6 +18,7 @@ AGENT="./team_code/comparison_agent.py"
 ROUTES="./leaderboard/data/bench2drive220.xml"
 SAVE_PATH_DIR="./results/bench2drive220"
 CHECKPOINT="${SAVE_PATH_DIR}/debug_results.json"
+RESUME=1
 
 # ===== Environment Variables =====
 export DEBUG_CHALLENGE=1
@@ -37,4 +38,5 @@ python ./leaderboard/leaderboard/leaderboard_evaluator_local.py \
     --agent-config "${AGENT_CONFIG}" \
     --agent "${AGENT}" \
     --routes "${ROUTES}" \
-    --checkpoint "${CHECKPOINT}"
+    --checkpoint "${CHECKPOINT}" \
+    --resume "${RESUME}"

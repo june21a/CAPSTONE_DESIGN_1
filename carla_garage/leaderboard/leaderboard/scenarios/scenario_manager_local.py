@@ -91,6 +91,14 @@ class ScenarioManager(object):
         """
         Reset all parameters
         """
+        self.route_index = None
+        self.scenario = None
+        self.scenario_tree = None
+        self.ego_vehicles = None
+        self.other_actors = None
+        self._agent_wrapper = None
+        self.repetition_number = None
+
         self._timestamp_last_run = 0.0
         self.scenario_duration_system = 0.0
         self.scenario_duration_game = 0.0

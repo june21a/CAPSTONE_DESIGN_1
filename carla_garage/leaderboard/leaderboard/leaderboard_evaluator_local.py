@@ -14,6 +14,7 @@ from __future__ import print_function
 
 import traceback
 import argparse
+import gc
 from argparse import RawTextHelpFormatter
 from datetime import datetime
 import importlib
@@ -34,6 +35,11 @@ from leaderboard.utils.statistics_manager_local import StatisticsManager, FAILUR
 from leaderboard.utils.route_indexer import RouteIndexer
 
 import pathlib
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 
 sensors_to_icons = {
@@ -140,10 +146,11 @@ class LeaderboardEvaluator(object):
         try:
             if self.agent_instance:
                 self.agent_instance.destroy(results)
-                del self.agent_instance
         except Exception as e:
             print("\n\033[91mFailed to stop the agent:")
             print(f"\n{traceback.format_exc()}\033[0m")
+        finally:
+            self.agent_instance = None
 
         if self.route_scenario:
             self.route_scenario.remove_all_actors()
@@ -160,6 +167,10 @@ class LeaderboardEvaluator(object):
         for sensor in alive_sensors:
             sensor.stop()
             sensor.destroy()
+
+        gc.collect()
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
     def find_free_port(self, start_port=2_000, end_port=40_000):
