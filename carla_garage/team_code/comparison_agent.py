@@ -7,6 +7,7 @@ adds semantic/depth sensors and uses privileged world state for BEV labels.
 
 import pathlib
 import json
+import ujson
 import os
 
 import cv2
@@ -298,8 +299,17 @@ class ComparisonAgent(SensorAgent):
     bev_semantic_path = self.vision_task_gt_paths['bev_semantic']
     depth_path = self.vision_task_gt_paths['depth']
     metrics_path = self.vision_task_gt_paths['metrics']
+    box_2d_path = self.vision_task_gt_paths['box_2d']
+    box_2d_overlay_path = self.vision_task_gt_paths['box_2d_overlay']
 
     metrics = {}
+    
+    rgb_image = self._tensor_rgb_to_numpy(tick_data['rgb'])
+    boxes_2d = tick_data.get('2d_box', [])
+    with open(box_2d_path / f'{frame_id}.json', 'w', encoding='utf-8') as outfile:
+      ujson.dump({'boxes': boxes_2d}, outfile, indent=2)
+    if boxes_2d:
+      cv2.imwrite(str(box_2d_overlay_path / f'{frame_id}.png'), self._draw_2d_boxes(rgb_image, boxes_2d))
 
     if 'gt_semantic' in tick_data:
       gt_semantic_raw = tick_data['gt_semantic']
@@ -375,13 +385,15 @@ class ComparisonAgent(SensorAgent):
     self.vision_task_gt_paths = None
     if self.save_path is None or not self.collect_sensor_data or not self.vision_task_visualization:
       return
-
+    
     gt_path = pathlib.Path(self.save_path) / 'sensor_data' / 'vision_tasks_gt'
     self.vision_task_gt_paths = {
         'semantic': gt_path / 'semantic',
         'bev_semantic': gt_path / 'bev_semantic',
         'depth': gt_path / 'depth',
         'metrics': gt_path / 'metrics',
+        'box_2d': gt_path / '2d_box',
+        'box_2d_overlay': gt_path / '2d_box_overlay'
     }
     for path in self.vision_task_gt_paths.values():
       path.mkdir(parents=True, exist_ok=True)

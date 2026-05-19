@@ -272,13 +272,14 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
   @staticmethod
   def _bbox_corners_local(bounding_box):
     extent = bounding_box.extent
-    location = bounding_box.location
     corners = []
     for x in (-extent.x, extent.x):
       for y in (-extent.y, extent.y):
         for z in (-extent.z, extent.z):
-          corners.append([location.x + x, location.y + y, location.z + z, 1.0])
-    return np.asarray(corners, dtype=np.float32)
+          corners.append([x, y, z, 1.0])
+
+    bbox_transform = carla.Transform(bounding_box.location, bounding_box.rotation)
+    return (np.asarray(bbox_transform.get_matrix(), dtype=np.float32) @ np.asarray(corners, dtype=np.float32).T).T
 
   @staticmethod
   def _transform_points(transform_matrix, points):
@@ -338,10 +339,13 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     boxes_2d = []
     actors = self._world.get_actors()
     actor_lists = (
-        ('car', actors.filter('*vehicle*')),
-        ('walker', actors.filter('*walker*')),
-        ('static', actors.filter('*static*')),
-    )
+      ('car', actors.filter('*vehicle*')),
+      ('walker', actors.filter('*walker*')),
+      ('traffic_light', actors.filter('*traffic_light*')),
+      ('stop_sign', actors.filter('*traffic.stop*')),
+      ('speed_limit', actors.filter('*speed_limit*')),
+      ('static', actors.filter('*static*')),
+  )
 
     for actor_class, actor_list in actor_lists:
       for actor in actor_list:
@@ -365,7 +369,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         if x_max <= x_min or y_max <= y_min:
           continue
 
-        boxes_2d.append({
+        box = {
             'class': actor_class,
             'id': int(actor.id),
             'type_id': actor.type_id,
@@ -374,7 +378,11 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
             'depth': float(np.min(depths)),
             'distance': float(actor.get_location().distance(ego_location)),
             'corners': points_2d.tolist(),
-        })
+        }
+        if actor_class == 'traffic_light':
+          box['state'] = int(actor.state)
+          box['state_str'] = str(actor.state)
+        boxes_2d.append(box)
 
     return boxes_2d
 
@@ -384,6 +392,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     color_by_class = {
         'car': (0, 255, 0),
         'walker': (0, 165, 255),
+        'traffic_light': (0, 0, 255),
         'static': (255, 0, 0),
     }
     for box in boxes_2d:
@@ -428,11 +437,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     overlay_path = sensor_path / 'attention_overlay'
     lidar_attention_map_path = sensor_path / 'lidar_attention'
     lidar_attention_path = sensor_path / 'lidar_attention_overlay'
-    box_2d_path = sensor_path / '2d_box'
-    box_2d_overlay_path = sensor_path / '2d_box_overlay'
     metadata_path = sensor_path / 'metadata'
-    for path in (rgb_path, lidar_path, attention_path, overlay_path, lidar_attention_map_path, lidar_attention_path,
-                 box_2d_path, box_2d_overlay_path, metadata_path):
+    for path in (rgb_path, lidar_path, attention_path, overlay_path, lidar_attention_map_path, lidar_attention_path, metadata_path):
       path.mkdir(parents=True, exist_ok=True)
 
     frame_id = f'{self.step:04}'
@@ -464,17 +470,11 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       cv2.imwrite(str(lidar_attention_path / f'{frame_id}_bev.png'), lidar_image)
       cv2.imwrite(str(lidar_attention_path / f'{frame_id}.png'), lidar_attention_overlay)
 
-    boxes_2d = tick_data.get('2d_box', [])
-    with open(box_2d_path / f'{frame_id}.json', 'w', encoding='utf-8') as outfile:
-      ujson.dump({'boxes': boxes_2d}, outfile, indent=2)
-    if boxes_2d:
-      cv2.imwrite(str(box_2d_overlay_path / f'{frame_id}.png'), self._draw_2d_boxes(rgb_image, boxes_2d))
 
     metadata = {
         'step': self.step,
         'speed': float(tick_data['speed'].detach().cpu().item()),
         'target_point': tick_data['target_point'].detach().cpu().numpy()[0].tolist(),
-        'num_2d_boxes': len(boxes_2d),
         'pred_target_speed_scalar': None if pred_target_speed_scalar is None else float(pred_target_speed_scalar),
         'control': {
             'steer': float(control.steer),
@@ -561,10 +561,20 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
           np.array([250, 160, 160]),
           np.array([16, 133, 133])
       ]
+      boxes_are_image_system = False
+      if boxes.size > 0:
+        metric_limit = max(abs(self.config.min_x), abs(self.config.max_x), abs(self.config.min_y),
+                           abs(self.config.max_y))
+        boxes_are_image_system = np.any(np.abs(boxes[:, :2]) > metric_limit * 2.0)
       for box in boxes:
-        color_box = color_classes[int(box[7]) % len(color_classes)]
-        box_image = t_u.bb_vehicle_to_image_system(box.copy(), loc_pixels_per_meter, self.config.min_x,
-                                                   self.config.min_y)
+        inv_brake = 1.0 - box[6]
+        color_box = deepcopy(color_classes[int(box[7]) % len(color_classes)])
+        color_box[1] = color_box[1] * inv_brake
+        if boxes_are_image_system:
+          box_image = box.copy()
+        else:
+          box_image = t_u.bb_vehicle_to_image_system(box.copy(), loc_pixels_per_meter, self.config.min_x,
+                                                     self.config.min_y)
         lidar_image = t_u.draw_box(lidar_image, box_image, color=color_box, pixel_per_meter=loc_pixels_per_meter)
       lidar_image = np.rot90(lidar_image, k=1)
       cv2.imwrite(str(detection_path / f'{frame_id}.png'), np.ascontiguousarray(lidar_image, dtype=np.uint8))
