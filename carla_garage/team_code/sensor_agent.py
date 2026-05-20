@@ -295,7 +295,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     pinhole_points = np.stack([points_camera[:, 1], -points_camera[:, 2], points_camera[:, 0]], axis=1)
     depths = pinhole_points[:, 2]
     valid = depths > 1e-3
-    if not np.any(valid):
+    if not np.all(valid):
       return None, None
 
     projected = (intrinsic_matrix @ pinhole_points[valid].T).T
@@ -543,9 +543,25 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     if pred_bb is not None:
       boxes = np.asarray(pred_bb, dtype=np.float32)
+      detection_class_names = ['car', 'walker', 'traffic_light', 'stop_sign', 'emergency_vehicle']
+      detections = []
+      for box in boxes:
+        class_id = int(box[7])
+        class_name = detection_class_names[class_id] if class_id < len(detection_class_names) else 'unknown'
+        detections.append({
+            'box': box.tolist(),
+            'class': class_name,
+            'class_id': class_id,
+            'confidence': float(box[8]) if len(box) > 8 else None,
+        })
       np.savez_compressed(detection_path / f'{frame_id}.npz', boxes=boxes)
       with open(detection_path / f'{frame_id}.json', 'w', encoding='utf-8') as outfile:
-        ujson.dump({'boxes': boxes.tolist()}, outfile, indent=2)
+        ujson.dump({
+            'boxes': boxes.tolist(),
+            'class_names': detection_class_names,
+            'box_format': ['x', 'y', 'extent_x', 'extent_y', 'yaw', 'speed', 'brake', 'class_id', 'confidence'],
+            'detections': detections,
+        }, outfile, indent=2)
 
       lidar_image = 255 - (lidar_bev.detach().cpu().numpy()[0][0] * 255).astype(np.uint8)
       lidar_image = np.stack([lidar_image, lidar_image, lidar_image], axis=-1)

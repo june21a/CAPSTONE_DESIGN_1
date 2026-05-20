@@ -89,8 +89,8 @@ while true; do
     RESTART_REASON=""
 
     while true; do
-        if ! kill -0 "${EVAL_PID}" 2>/dev/null; then
-            wait "${EVAL_PID}"
+        if ! kill -0 "${CARLA_PID}" 2>/dev/null; then
+            wait "${CARLA_PID}"
             EVAL_STATUS=$?
             log "Evaluation finished with exit code ${EVAL_STATUS}"
             stop_carla
