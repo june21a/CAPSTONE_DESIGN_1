@@ -25,6 +25,22 @@ log() {
     echo "[$(timestamp)] $*"
 }
 
+check_carla() {
+    python - <<'PY'
+import sys
+import carla
+
+try:
+    client = carla.Client("localhost", 2000)
+    client.set_timeout(5.0)
+    client.get_world()
+    sys.exit(0)
+except Exception as e:
+    print(e)
+    sys.exit(1)
+PY
+}
+
 start_carla() {
     local log_file="${LOG_DIR}/carla_$(date +%Y%m%d_%H%M%S).log"
 
@@ -87,7 +103,7 @@ while true; do
     RESTART_REASON=""
 
     while true; do
-        if ! kill -0 "${CARLA_PID}" 2>/dev/null; then
+        if ! check_carla; then
             wait "${CARLA_PID}"
             EVAL_STATUS=$?
             log "Evaluation finished with exit code ${EVAL_STATUS}"
