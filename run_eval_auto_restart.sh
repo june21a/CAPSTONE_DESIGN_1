@@ -38,8 +38,7 @@ start_carla() {
 stop_carla() {
     if [[ -n "${CARLA_PID}" ]] && kill -0 "${CARLA_PID}" 2>/dev/null; then
         log "Stopping CARLA PID ${CARLA_PID}"
-        kill -9 -- -"${CARLA_PID}" 2>/dev/null
-        wait "${CARLA_PID}" 2>/dev/null || true
+        kill -9 "${CARLA_PID}"
     fi
 }
 
@@ -56,8 +55,7 @@ start_eval() {
 stop_eval() {
     if [[ -n "${EVAL_PID}" ]] && kill -0 "${EVAL_PID}" 2>/dev/null; then
         log "Stopping evaluation PID ${EVAL_PID}"
-        kill -9 "${EVAL_PID}" 2>/dev/null || true
-        wait "${EVAL_PID}" 2>/dev/null || true
+        kill -9 "${EVAL_PID}"
     fi
 }
 
@@ -94,17 +92,15 @@ while true; do
             EVAL_STATUS=$?
             log "Evaluation finished with exit code ${EVAL_STATUS}"
             stop_carla
-            sleep 10
+            sleep 15
             stop_eval
-
-            if [[ "${EVAL_STATUS}" -eq 0 ]]; then
-                exit 0
-            fi
-
-            RESTART_REASON="evaluation exited with failure"
+            sleep 15
             break
         fi
 
+        if [[ "${EVAL_STATUS}" -eq 0 ]]; then
+                exit 0
+        fi
         sleep 10
     done
 

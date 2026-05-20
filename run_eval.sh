@@ -15,8 +15,8 @@ export PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${SCENARIO_RUNNER_ROOT}:${LEADE
 CARLA_GARAGE_DIR="${CURRENT_DIR}/carla_garage"
 AGENT_CONFIG="./pretrained_models/all_towns"
 AGENT="./team_code/comparison_agent.py"
-ROUTES="./leaderboard/data/bench2drive220.xml"
-SAVE_PATH_DIR="./results/bench2drive220"
+ROUTES="./leaderboard/data/bench2drive220_test_sample_55.xml"
+SAVE_PATH_DIR="./results/bench2drive220_test_sample_55"
 CHECKPOINT="${SAVE_PATH_DIR}/debug_results.json"
 RESUME=1
 
