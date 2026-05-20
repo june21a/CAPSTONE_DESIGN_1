@@ -5,7 +5,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CARLA_DIR="${SCRIPT_DIR}/carla_garage/carla"
 LOG_DIR="${SCRIPT_DIR}/logs"
-CARLA_STARTUP_WAIT="${CARLA_STARTUP_WAIT:-20}"
+CARLA_STARTUP_WAIT="${CARLA_STARTUP_WAIT:-40}"
 CARLA_RESTART_WAIT="${CARLA_RESTART_WAIT:-5}"
 RESTART_EVAL_ON_FAILURE="${RESTART_EVAL_ON_FAILURE:-1}"
 MAX_RESTARTS="${MAX_RESTARTS:-0}"
@@ -103,7 +103,7 @@ while true; do
     RESTART_REASON=""
 
     while true; do
-        if ! check_carla; then
+        if ! check_carla || kill -0 "${EVAL_PID}" 2>/dev/null; then
             wait "${CARLA_PID}"
             EVAL_STATUS=$?
             log "Evaluation finished with exit code ${EVAL_STATUS}"

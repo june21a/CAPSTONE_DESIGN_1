@@ -34,7 +34,7 @@ export FORCE_CPU=0
 cd "${CARLA_GARAGE_DIR}" || exit
 
 # ===== Run =====
-python ./leaderboard/leaderboard/leaderboard_evaluator_local.py \
+exec python ./leaderboard/leaderboard/leaderboard_evaluator_local.py \
     --agent-config "${AGENT_CONFIG}" \
     --agent "${AGENT}" \
     --routes "${ROUTES}" \
