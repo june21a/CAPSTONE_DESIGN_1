@@ -896,7 +896,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     if self.config.backbone not in ('aim'):
       self.lidar_last = deepcopy(tick_data['lidar'])
 
-    # prepare velocity input
+    # prepare velocity(ego vehicle) input
     gt_velocity = tick_data['speed']
     velocity = gt_velocity.reshape(1, 1)  # used by transfuser
 
@@ -917,7 +917,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     wp_selected = None
     rgb_attention_maps = []
     lidar_attention_maps = []
-    for i in range(self.model_count):
+    for i in range(self.model_count): # iterate all models using for ensemble
       if self.config.backbone in ('transFuser', 'aim', 'bev_encoder'):
         pred_wp, \
         pred_target_speed, \
