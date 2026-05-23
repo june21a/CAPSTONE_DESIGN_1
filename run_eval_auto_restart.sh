@@ -45,7 +45,14 @@ start_carla() {
     local log_file="${LOG_DIR}/carla_$(date +%Y%m%d_%H%M%S).log"
 
     log "Starting CARLA server. Log: ${log_file}"
-    setsid bash -c 'cd "$1" || exit 1; exec ./CarlaUE4.sh -RenderOffScreen' _ "${CARLA_DIR}" >"${log_file}" 2>&1 &
+    setsid bash -lc "
+    cd '${CARLA_DIR}' || exit 1
+    export XDG_RUNTIME_DIR=/tmp/runtime-$(whoami)
+    mkdir -p \"\$XDG_RUNTIME_DIR\"
+    chmod 700 \"\$XDG_RUNTIME_DIR\"
+
+    exec ./CarlaUE4.sh -RenderOffScreen -nosound -carla-rpc-port=2000
+" >"${log_file}" 2>&1 &
 
     CARLA_PID=$!
     log "CARLA PID: ${CARLA_PID}"
