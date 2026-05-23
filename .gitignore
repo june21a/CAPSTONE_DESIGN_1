@@ -208,3 +208,6 @@ __marimo__/
 
 # training data of carla garage
 training_data
+
+# vscode
+.vscode
