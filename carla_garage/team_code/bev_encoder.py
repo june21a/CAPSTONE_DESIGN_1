@@ -143,7 +143,7 @@ class BevEncoder(nn.Module):
 
     return p3
 
-  def forward(self, image, lidar):
+  def forward(self, image, lidar, return_gradcam_features=False):
     """
         Image + LiDAR feature fusion in BEV
     """

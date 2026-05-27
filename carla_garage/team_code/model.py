@@ -432,6 +432,196 @@ class LidarCenterNet(nn.Module):
     return pred_wp, pred_target_speed, pred_checkpoint, pred_semantic, pred_bev_semantic, pred_depth, \
       pred_bounding_box, attention_weights, pred_wp_1, selected_path
 
+  def _compute_cam_from_feature_and_grad(self, feature, grad):
+    # feature: (B,C,H,W), grad: (B,C,H,W)
+    # global-average pool gradients over spatial dims to get channel weights
+    if grad is None or feature is None:
+      return None
+    weights = torch.mean(grad, dim=(2, 3), keepdim=True)  # (B,C,1,1)
+    cam = torch.sum(weights * feature, dim=1, keepdim=False)  # (B,H,W)
+    cam = F.relu(cam)
+    # Normalize per-sample
+    cam_min = cam.view(cam.shape[0], -1).min(dim=1)[0].view(-1, 1, 1)
+    cam_max = cam.view(cam.shape[0], -1).max(dim=1)[0].view(-1, 1, 1)
+    cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
+    return cam
+
+  def compute_gradcam_maps(self, rgb, lidar_bev, target_point, ego_vel, command, target_point_next=None):
+    """
+    Compute Grad-CAM maps for image (rgb) and BEV (lidar_bev) feature grids.
+    Returns tuple (img_cam_np, bev_cam_np) normalized in [0,1] (None if unavailable).
+    """
+    # Convert any inference-mode tensors into regular tensors for autograd.
+    rgb = rgb.detach().clone()
+    lidar_bev = lidar_bev.detach().clone()
+    target_point = target_point.detach().clone()
+    ego_vel = ego_vel.detach().clone()
+    command = command.detach().clone()
+    if target_point_next is not None:
+      target_point_next = target_point_next.detach().clone()
+
+    if self.config.two_tp_input and target_point_next is not None:
+      tp = torch.cat((target_point, target_point_next), axis=1)
+    else:
+      tp = target_point
+
+    was_training = self.training
+    self.eval()
+    if hasattr(self, 'checkpoint_decoder'):
+      self.checkpoint_decoder.train(True)
+    
+    image_feature_grid_for_gradcam = None
+    if self.config.backbone == 'transFuser' or self.config.backbone == 'bev_encoder':
+      outputs = self.backbone(rgb, lidar_bev, return_gradcam_features=True)
+      if len(outputs) == 4:
+        bev_feature_grid, fused_features, image_feature_grid, image_feature_grid_for_gradcam = outputs
+      else:
+        bev_feature_grid, fused_features, image_feature_grid = outputs
+    elif self.config.backbone == 'aim':
+      fused_features, image_feature_grid = self.backbone(rgb)
+      bev_feature_grid = None
+    else:
+      bev_feature_grid, fused_features, image_feature_grid = self.backbone(rgb, lidar_bev)
+
+    # Prefer connected image features for gradcam if available.
+    if image_feature_grid_for_gradcam is None:
+      image_feature_grid_for_gradcam = image_feature_grid
+
+    # Ensure grads are tracked
+    if image_feature_grid_for_gradcam is not None:
+      image_feature_grid_for_gradcam.requires_grad_(True)
+    if bev_feature_grid is not None:
+      bev_feature_grid.requires_grad_(True)
+    if fused_features is not None and isinstance(fused_features, torch.Tensor) and fused_features.ndim == 4:
+      fused_features.requires_grad_(True)
+
+    grads = {}
+    if image_feature_grid_for_gradcam is not None:
+      def _save_img_grad(g):
+        grads['img'] = g.detach()
+      image_feature_grid_for_gradcam.register_hook(_save_img_grad)
+    if bev_feature_grid is not None:
+      def _save_bev_grad(g):
+        grads['bev'] = g.detach()
+      bev_feature_grid.register_hook(_save_bev_grad)
+    if fused_features is not None and isinstance(fused_features, torch.Tensor) and fused_features.ndim == 4:
+      def _save_fused_grad(g):
+        grads['fused'] = g.detach()
+      fused_features.register_hook(_save_fused_grad)
+
+    bs = rgb.shape[0]
+
+    # Recompute the pipeline up to pred_checkpoint similar to forward
+    pred_checkpoint = None
+    if self.config.use_controller_input_prediction:
+      if self.config.transformer_decoder_join:
+        # fused_features expected to be spatial (B, C, H, W)
+        fused = self.change_channel(fused_features)
+        # add positional encoding
+        fused = fused + self.encoder_pos_encoding(fused)
+        fused = torch.flatten(fused, start_dim=2)
+        if self.extra_sensors:
+          extra_sensors = []
+          if self.config.use_velocity:
+            extra_sensors.append(self.velocity_normalization(ego_vel))
+          if self.config.use_discrete_command:
+            extra_sensors.append(command)
+          extra_sensors = torch.cat(extra_sensors, axis=1)
+          extra_sensors = self.extra_sensor_encoder(extra_sensors)
+          extra_sensors = extra_sensors + self.extra_sensor_pos_embed.repeat(bs, 1)
+          fused = torch.cat((fused, extra_sensors.unsqueeze(2)), axis=2)
+
+        fused = torch.permute(fused, (0, 2, 1))
+        # Prepare checkpoint query
+        q = self.checkpoint_query.repeat(bs, 1, 1)
+        # If tp attention required, append tp token
+        if self.config.tp_attention:
+          tp_token = self.tp_encoder(tp)
+          tp_token = tp_token + self.tp_pos_embed
+          fused = torch.cat((fused, tp_token.unsqueeze(1)), axis=1)
+          out = self.join(q, fused)
+          # join may return (out, attention)
+          if isinstance(out, tuple):
+            joined_checkpoint_features = out[0]
+          else:
+            joined_checkpoint_features = out
+        else:
+          out = self.join(q, fused)
+          if isinstance(out, tuple):
+            joined_checkpoint_features = out[0]
+          else:
+            joined_checkpoint_features = out
+
+        gru_features = joined_checkpoint_features[:, :self.config.predict_checkpoint_len]
+        pred_checkpoint = self.checkpoint_decoder(gru_features, tp)
+
+      else:
+        # non-transformer-join path: global pool image/lidar then join
+        # image_feature_grid and bev_feature_grid may be None for some backbones
+        if image_feature_grid is not None:
+          image_feats = self.global_pool_img(image_feature_grid)
+          image_feats = torch.flatten(image_feats, 1)
+        else:
+          image_feats = None
+        if bev_feature_grid is not None:
+          lidar_feats = self.global_pool_lidar(bev_feature_grid)
+          lidar_feats = torch.flatten(lidar_feats, 1)
+        else:
+          lidar_feats = None
+
+        if image_feats is None:
+          fused_vec = lidar_feats
+        elif lidar_feats is None:
+          fused_vec = image_feats
+        else:
+          if self.config.add_features:
+            lidar_feats = self.lidar_to_img_features_end(lidar_feats)
+            fused_vec = image_feats + lidar_feats
+          else:
+            fused_vec = torch.cat((image_feats, lidar_feats), dim=1)
+
+        if self.extra_sensors:
+          extra_sensors = []
+          if self.config.use_velocity:
+            extra_sensors.append(self.velocity_normalization(ego_vel))
+          if self.config.use_discrete_command:
+            extra_sensors.append(command)
+          extra_sensors = torch.cat(extra_sensors, axis=1)
+          extra_sensors = self.extra_sensor_encoder(extra_sensors)
+          fused_vec = torch.cat((fused_vec, extra_sensors), axis=1)
+
+        joined = self.join(fused_vec)
+        if isinstance(joined, tuple):
+          joined = joined[0]
+        gru_features = joined
+        pred_checkpoint = self.checkpoint_decoder(gru_features, tp)
+
+    # If we didn't get a pred_checkpoint, cannot compute gradcam
+    if pred_checkpoint is None:
+      return None, None
+
+    # Backprop scalar from mean of pred_checkpoint
+    # Clear existing gradients
+    self.zero_grad(set_to_none=True)
+    scalar = pred_checkpoint.mean()
+    scalar.backward(retain_graph=False)
+    self.train(was_training)
+
+    # Build CAMs from saved grads
+    img_cam = None
+    bev_cam = None
+    if 'img' in grads and image_feature_grid_for_gradcam is not None:
+      cam_t = self._compute_cam_from_feature_and_grad(image_feature_grid_for_gradcam, grads['img'])
+      img_cam = cam_t.detach().cpu().numpy()
+    if 'bev' in grads and bev_feature_grid is not None:
+      cam_b = self._compute_cam_from_feature_and_grad(bev_feature_grid, grads['bev'])
+      bev_cam = cam_b.detach().cpu().numpy()
+    elif 'fused' in grads and fused_features is not None and isinstance(fused_features, torch.Tensor) and fused_features.ndim == 4:
+      cam_b = self._compute_cam_from_feature_and_grad(fused_features, grads['fused'])
+      bev_cam = cam_b.detach().cpu().numpy()
+
+    return img_cam, bev_cam
+
   def compute_loss(self, pred_wp, pred_target_speed, pred_checkpoint, pred_semantic, pred_bev_semantic, pred_depth,
                    pred_bounding_box, pred_wp_1, selected_path, waypoint_label, target_speed_label, checkpoint_label,
                    semantic_label, bev_semantic_label, depth_label, center_heatmap_label, wh_label, yaw_class_label,

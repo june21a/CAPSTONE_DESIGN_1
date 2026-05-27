@@ -69,6 +69,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     self.vision_task_paths = None
     self.collect_sensor_data = strtobool(os.environ.get('COLLECT_SENSOR_DATA', '0'))
     self.attention_visualization = strtobool(os.environ.get('ATTENTION_VIS', '1'))
+    self.gradcam_visualization = strtobool(os.environ.get('ATTENTION_VIS_GRAD', '0'))
     self.vision_task_visualization = strtobool(os.environ.get('VISION_TASK_VIS', '1'))
     self.attention_save_freq = max(1, int(os.environ.get('ATTENTION_SAVE_FREQ', '1')))
     self._ego_vehicle = None
@@ -426,7 +427,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     return np.ascontiguousarray(lidar_image, dtype=np.uint8), np.ascontiguousarray(overlay, dtype=np.uint8)
 
   def _save_sensor_attention_data(self, tick_data, lidar_bev, rgb_attention_map, lidar_attention_map, control,
-                                  pred_target_speed_scalar):
+                                  pred_target_speed_scalar, img_gradcam=None, bev_gradcam=None):
     if self.save_path is None or not self.collect_sensor_data or self.step % self.attention_save_freq != 0:
       return
 
@@ -437,8 +438,14 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     overlay_path = sensor_path / 'attention_overlay'
     lidar_attention_map_path = sensor_path / 'lidar_attention'
     lidar_attention_path = sensor_path / 'lidar_attention_overlay'
+    gradcam_rgb_path = sensor_path / 'gradcam_rgb'
+    gradcam_rgb_overlay_path = sensor_path / 'gradcam_rgb_overlay'
+    gradcam_bev_path = sensor_path / 'gradcam_bev'
+    gradcam_bev_overlay_path = sensor_path / 'gradcam_bev_overlay'
     metadata_path = sensor_path / 'metadata'
-    for path in (rgb_path, lidar_path, attention_path, overlay_path, lidar_attention_map_path, lidar_attention_path, metadata_path):
+    for path in (rgb_path, lidar_path, attention_path, overlay_path, lidar_attention_map_path,
+                 lidar_attention_path, gradcam_rgb_path, gradcam_rgb_overlay_path,
+                 gradcam_bev_path, gradcam_bev_overlay_path, metadata_path):
       path.mkdir(parents=True, exist_ok=True)
 
     frame_id = f'{self.step:04}'
@@ -470,6 +477,24 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       cv2.imwrite(str(lidar_attention_path / f'{frame_id}_bev.png'), lidar_image)
       cv2.imwrite(str(lidar_attention_path / f'{frame_id}.png'), lidar_attention_overlay)
 
+    if self.attention_visualization and img_gradcam is not None:
+      img_gradcam = np.asarray(img_gradcam[0], dtype=np.float32)
+      np.savez_compressed(gradcam_rgb_path / f'{frame_id}.npz', gradcam=img_gradcam)
+      gradcam_uint8 = (img_gradcam * 255).astype(np.uint8)
+      gradcam_uint8 = cv2.resize(gradcam_uint8,
+                                 dsize=(rgb_image.shape[1], rgb_image.shape[0]),
+                                 interpolation=cv2.INTER_LINEAR)
+      heatmap = cv2.applyColorMap(gradcam_uint8, cv2.COLORMAP_JET)
+      rgb_bgr = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+      overlay = cv2.addWeighted(rgb_bgr, 0.7, heatmap, 0.3, 0)
+      cv2.imwrite(str(gradcam_rgb_overlay_path / f'{frame_id}.png'), overlay)
+
+    if self.attention_visualization and bev_gradcam is not None:
+      bev_gradcam = np.asarray(bev_gradcam[0], dtype=np.float32)
+      np.savez_compressed(gradcam_bev_path / f'{frame_id}.npz', gradcam=bev_gradcam)
+      bev_image, bev_overlay = self._draw_attention_on_lidar_bev(lidar_bev, bev_gradcam)
+      cv2.imwrite(str(gradcam_bev_overlay_path / f'{frame_id}_bev.png'), bev_image)
+      cv2.imwrite(str(gradcam_bev_overlay_path / f'{frame_id}.png'), bev_overlay)
 
     metadata = {
         'step': self.step,
@@ -812,7 +837,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     return result
 
-  @torch.inference_mode()  # Turns off gradient computation
+  @torch.no_grad()  # Turns off gradient computation, but allows nested enable_grad
   def run_step(self, input_data, timestamp, sensors=None):  # pylint: disable=locally-disabled, unused-argument
     self.step += 1
 
@@ -1012,6 +1037,18 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     else:
       lidar_attention_map = None
 
+    img_gradcam = None
+    bev_gradcam = None
+    if self.attention_visualization and self.gradcam_visualization and self.config.use_controller_input_prediction:
+      with torch.enable_grad():
+        img_gradcam, bev_gradcam = self.nets[0].compute_gradcam_maps(
+            rgb=tick_data['rgb'],
+            lidar_bev=lidar_bev,
+            target_point=tick_data['target_point'],
+            ego_vel=velocity,
+            command=tick_data['command'],
+            target_point_next=tick_data['target_point_next'] if self.config.two_tp_input else None)
+
     # Visualize the output of the last model
     if compute_debug_output:
       if self.config.use_controller_input_prediction:
@@ -1102,7 +1139,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     control = carla.VehicleControl(steer=float(steer), throttle=float(throttle), brake=float(brake))
     self._save_sensor_attention_data(tick_data, lidar_bev, rgb_attention_map, lidar_attention_map, control,
-                                     pred_target_speed_scalar)
+                                     pred_target_speed_scalar, img_gradcam=img_gradcam, bev_gradcam=bev_gradcam)
     self._save_vision_task_data(tick_data, lidar_bev, pred_semantic, pred_bev_semantic, pred_depth,
                                 bbs_vehicle_coordinate_system)
 

@@ -136,7 +136,7 @@ class TransfuserBackbone(nn.Module):
 
     return p3
 
-  def forward(self, image, lidar):
+  def forward(self, image, lidar, return_gradcam_features=False):
     '''
         Image + LiDAR feature fusion using transformers
         Args:
@@ -166,8 +166,11 @@ class TransfuserBackbone(nn.Module):
     if len(self.lidar_encoder.return_layers) > 4:
       lidar_features = self.forward_layer_block(lidar_layers, self.lidar_encoder.return_layers, lidar_features)
 
+    image_features_for_gradcam = None
     # Loop through the 4 blocks of the network.
     for i in range(4):
+      if return_gradcam_features and i == 3:
+        image_features_for_gradcam = image_features
       image_features = self.forward_layer_block(image_layers, self.image_encoder.return_layers, image_features)
       lidar_features = self.forward_layer_block(lidar_layers, self.lidar_encoder.return_layers, lidar_features)
 
@@ -202,6 +205,8 @@ class TransfuserBackbone(nn.Module):
     else:
       features = None
 
+    if return_gradcam_features:
+      return features, fused_features, image_feature_grid, image_features_for_gradcam
     return features, fused_features, image_feature_grid
 
   def forward_layer_block(self, layers, return_layers, features):

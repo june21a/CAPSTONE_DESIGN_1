@@ -27,7 +27,7 @@ class AIMBackbone(nn.Module):
     self.num_image_features = self.image_encoder.feature_info.info[start_index + 3]['num_chs']
     self.num_features = self.image_encoder.feature_info.info[start_index + 3]['num_chs']
 
-  def forward(self, image):
+  def forward(self, image, return_gradcam_features=False):
     """standard forward pass"""
     if self.config.normalize_imagenet:
       image_features = t_u.normalize_imagenet(image)
