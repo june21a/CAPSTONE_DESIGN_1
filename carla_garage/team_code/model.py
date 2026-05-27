@@ -553,7 +553,9 @@ class LidarCenterNet(nn.Module):
             joined_checkpoint_features = out
 
         gru_features = joined_checkpoint_features[:, :self.config.predict_checkpoint_len]
+        target_speed_features = joined_checkpoint_features[:, :self.config.predict_checkpoint_len]
         pred_checkpoint = self.checkpoint_decoder(gru_features, tp)
+        pred_target_speed = self.target_speed_network(target_speed_features)
 
       else:
         # non-transformer-join path: global pool image/lidar then join
@@ -603,7 +605,7 @@ class LidarCenterNet(nn.Module):
     # Backprop scalar from mean of pred_checkpoint
     # Clear existing gradients
     self.zero_grad(set_to_none=True)
-    scalar = pred_checkpoint.mean()
+    scalar = pred_checkpoint.mean() + pred_target_speed.mean()
     scalar.backward(retain_graph=False)
     self.train(was_training)
 
