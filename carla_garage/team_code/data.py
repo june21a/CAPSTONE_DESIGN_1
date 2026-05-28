@@ -56,6 +56,7 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
     self.lidars = []
     self.boxes = []
     self.future_boxes = []
+    self.mode_labels = []
     self.measurements = []
     self.sample_start = []
 
@@ -199,6 +200,7 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
           self.lidars.append(lidar)
           self.boxes.append(box)
           self.future_boxes.append(future_box)
+          self.mode_labels.append(route_dir + '/mode_labels.json.gz')
           self.measurements.append(measurement)
           self.sample_start.append(seq)
 
@@ -256,6 +258,7 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
     self.lidars = np.array(self.lidars).astype(np.string_)
     self.boxes = np.array(self.boxes).astype(np.string_)
     self.future_boxes = np.array(self.future_boxes).astype(np.string_)
+    self.mode_labels = np.array(self.mode_labels).astype(np.string_)
     self.measurements = np.array(self.measurements).astype(np.string_)
 
     self.temporal_lidars = np.array(self.temporal_lidars).astype(np.string_)
@@ -289,6 +292,7 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
     lidars = self.lidars[index]
     boxes = self.boxes[index]
     future_boxes = self.future_boxes[index]
+    mode_labels = self.mode_labels[index]
     measurements = self.measurements[index]
     sample_start = self.sample_start[index]
 
@@ -523,6 +527,23 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
       loaded_temporal_measurements.reverse()
 
     current_measurement = loaded_measurements[self.config.seq_len - 1]
+    if self.config.use_mode_prediction:
+      mode_label_file = str(mode_labels, encoding='utf-8')
+      if (not self.data_cache is None) and (mode_label_file in self.data_cache):
+        mode_labels_i = self.data_cache[mode_label_file]
+      elif os.path.isfile(mode_label_file):
+        with gzip.open(mode_label_file, 'rt', encoding='utf-8') as f1:
+          mode_labels_i = ujson.load(f1)
+        if not self.data_cache is None:
+          self.data_cache[mode_label_file] = mode_labels_i
+      else:
+        mode_labels_i = None
+
+      frame_key = f'{sample_start + self.config.seq_len - 1:04}'
+      if mode_labels_i is not None and frame_key in mode_labels_i.get('frames', {}):
+        data['mode_label'] = int(mode_labels_i['frames'][frame_key])
+      else:
+        data['mode_label'] = int(not (current_measurement['brake'] or current_measurement['target_speed'] <= 0.1))
 
     # Determine whether the augmented camera or the normal camera is used.
     if random.random() <= self.config.augment_percentage and self.config.augment and loaded_images_augmented[

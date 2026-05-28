@@ -500,6 +500,7 @@ class GlobalConfig:
         'loss_brake': 1.0,
         'loss_forcast': 0.2,
         'loss_selection': 0.0,
+        'loss_mode': 1.0,
     }
     self.root_dir = ''
     self.val_towns = []
@@ -823,6 +824,12 @@ class GlobalConfig:
     self.plant_pretraining = None
     self.plant_max_speed_pred = 60.0  # Maximum speed we classify when forcasting cars.
     self.forcast_time = 0.5  # Number of seconds we forcast into the future
+
+    # -----------------------------------------------------------------------------
+    # Mode Predictor
+    # -----------------------------------------------------------------------------
+    self.use_mode_prediction = True
+    self.mode_stop_threshold = 0.5
 
   def initialize(self, root_dir='', setting='all', **kwargs):
     for k, v in kwargs.items():

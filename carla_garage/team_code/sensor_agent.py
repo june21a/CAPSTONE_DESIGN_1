@@ -913,6 +913,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     pred_wps = []
     pred_target_speeds = []
     pred_checkpoints = []
+    pred_modes = []
     bounding_boxes = []
     wp_selected = None
     rgb_attention_maps = []
@@ -928,7 +929,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         pred_bb_features,\
         attention_weights,\
         pred_wp_1,\
-        selected_path = self.nets[i].forward(
+        selected_path,\
+        pred_mode = self.nets[i].forward(
           rgb=tick_data['rgb'],
           lidar_bev=lidar_bev,
           target_point=tick_data['target_point'],
@@ -963,6 +965,9 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       if self.config.use_controller_input_prediction:
         pred_target_speeds.append(F.softmax(pred_target_speed[0], dim=0))
         pred_checkpoints.append(pred_checkpoint[0])
+      if self.config.use_mode_prediction:
+        _, pred_mode_prob = pred_mode
+        pred_modes.append(pred_mode_prob[0])
 
       bounding_boxes.append(pred_bounding_box)
 
@@ -999,6 +1004,11 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       else:
         pred_target_speed_index = torch.argmax(pred_target_speed_ensemble)
         pred_target_speed_scalar = self.inference_target_speeds[pred_target_speed_index]
+      if self.config.use_mode_prediction and len(pred_modes) > 0:
+        pred_mode_ensemble = torch.stack(pred_modes, dim=0).mean(dim=0)
+        stop_threshold = getattr(self.config, 'mode_stop_threshold', 0.5)
+        if pred_mode_ensemble[0].item() >= stop_threshold:
+          pred_target_speed_scalar = self.inference_target_speeds[0]
     else:
       pred_target_speed_scalar = None
 

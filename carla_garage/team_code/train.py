@@ -371,6 +371,14 @@ def main():
                       type=str,
                       default=str(config.compile_mode),
                       help='compile mode for torch compile')
+  parser.add_argument('--use_mode_prediction',
+                      type=int,
+                      default=int(config.use_mode_prediction),
+                      help='Whether to train and run the stop/move mode prediction head.')
+  parser.add_argument('--mode_stop_threshold',
+                      type=float,
+                      default=float(config.mode_stop_threshold),
+                      help='Stop probability threshold used by inference when mode prediction is enabled.')
 
   args = parser.parse_args()
   args.logdir = os.path.join(args.logdir, args.id)
@@ -446,6 +454,9 @@ def main():
 
   if not config.use_wp_gru:
     config.detailed_loss_weights['loss_wp'] = 0.0
+
+  if not config.use_mode_prediction:
+    config.detailed_loss_weights['loss_mode'] = 0.0
 
   if not config.use_semantic:
     config.detailed_loss_weights['loss_semantic'] = 0.0
@@ -789,6 +800,10 @@ class Engine(object):
       target_speed = data['target_speed_twohot'].to(self.device, dtype=torch.float32)
     else:
       target_speed = data['target_speed'].to(self.device, dtype=torch.long)
+    if self.config.use_mode_prediction:
+      mode_label = data['mode_label'].to(self.device, dtype=torch.long)
+    else:
+      mode_label = None
 
     # Load model specific data and execute model
     if self.config.use_plant:
@@ -834,7 +849,8 @@ class Engine(object):
       pred_depth, \
       pred_bounding_box, _, \
       pred_wp_1, \
-      selected_path = self.model(rgb=rgb,
+      selected_path, \
+      pred_mode = self.model(rgb=rgb,
                           lidar_bev=lidar,
                           target_point=target_point,
                           ego_vel=ego_vel,
@@ -879,7 +895,9 @@ class Engine(object):
                             pixel_weight_label=bb_pixel_weight,
                             avg_factor_label=bb_avg_factor,
                             pred_wp_1=pred_wp_1,
-                            selected_path=selected_path)
+                            selected_path=selected_path,
+                            pred_mode=pred_mode,
+                            mode_label=mode_label)
 
     # Compute metrics for logging
     metrics = {}

@@ -60,6 +60,10 @@ class LidarCenterNet(nn.Module):
     if self.config.detect_boxes:
       self.head = LidarCenterNetHead(self.config)
 
+    if self.config.use_mode_prediction:
+      self.mode_head = ModePredictionHead(self.backbone.num_features)
+      self.loss_mode = nn.CrossEntropyLoss(label_smoothing=0.0)
+
     if self.config.use_semantic:
       self.semantic_decoder = t_u.PerspectiveDecoder(
           in_channels=self.backbone.num_image_features,
@@ -311,6 +315,9 @@ class LidarCenterNet(nn.Module):
     attention_weights = None
     pred_wp_1 = None
     selected_path = None
+    mode = None
+    if self.config.use_mode_prediction:
+      mode = self.mode_head(fused_features)
 
     if self.config.use_wp_gru or self.config.use_controller_input_prediction:
       if self.config.transformer_decoder_join:
@@ -430,14 +437,19 @@ class LidarCenterNet(nn.Module):
     self.latest_attention_map = self.latest_rgb_attention_map
 
     return pred_wp, pred_target_speed, pred_checkpoint, pred_semantic, pred_bev_semantic, pred_depth, \
-      pred_bounding_box, attention_weights, pred_wp_1, selected_path
+      pred_bounding_box, attention_weights, pred_wp_1, selected_path, mode
 
   def compute_loss(self, pred_wp, pred_target_speed, pred_checkpoint, pred_semantic, pred_bev_semantic, pred_depth,
                    pred_bounding_box, pred_wp_1, selected_path, waypoint_label, target_speed_label, checkpoint_label,
                    semantic_label, bev_semantic_label, depth_label, center_heatmap_label, wh_label, yaw_class_label,
                    yaw_res_label, offset_label, velocity_label, brake_target_label, pixel_weight_label,
-                   avg_factor_label):
+                   avg_factor_label, pred_mode=None, mode_label=None):
     loss = {}
+    if self.config.use_mode_prediction:
+      mode_logits, _ = pred_mode
+      loss_mode = self.loss_mode(mode_logits, mode_label)
+      loss.update({'loss_mode': loss_mode})
+
     if self.config.use_wp_gru:
       if self.config.multi_wp_output:
         loss_wp = torch.mean(torch.abs(pred_wp - waypoint_label), dim=(1, 2))
@@ -1025,3 +1037,43 @@ class PositionEmbeddingSine(nn.Module):
     pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
     pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
     return pos
+
+
+class ModePredictionHead(nn.Module):
+    """
+    fused_feature: (B, C, H, W) or (B, C)
+    output:
+      mode_logits: (B, 2)  # 0=stop, 1=move
+      mode_prob:   (B, 2)
+    """
+
+    def __init__(self, in_channels, hidden_dim=256, dropout=0.1):
+        super().__init__()
+
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+
+        self.classifier = nn.Sequential(
+            nn.Linear(in_channels, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+
+            nn.Linear(hidden_dim, 2)
+        )
+
+    def forward(self, fused_feature):
+        if fused_feature.ndim == 4:
+            x = self.gap(fused_feature)  # (B, C, 1, 1)
+            x = torch.flatten(x, 1)      # (B, C)
+        elif fused_feature.ndim == 2:
+            x = fused_feature
+        else:
+            raise ValueError(f'ModePredictionHead expects 2D or 4D features, got {fused_feature.shape}')
+
+        mode_logits = self.classifier(x) # (B, 2)
+        mode_prob = F.softmax(mode_logits, dim=1)
+
+        return mode_logits, mode_prob
