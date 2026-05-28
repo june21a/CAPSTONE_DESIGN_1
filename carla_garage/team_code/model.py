@@ -504,17 +504,59 @@ class LidarCenterNet(nn.Module):
                          pred_target_speed,
                          speed,
                          ego_vehicle_location=0,
-                         ego_vehicle_rotation=0):
+                         ego_vehicle_rotation=0,
+                         bboxes=None): # [변경점 1] 파라미터에 bboxes 추가
     if self.make_histogram:
       self.speed_histogram.append(pred_target_speed * 3.6)
 
     # Convert to numpy
     speed = speed[0].data.cpu().numpy()
 
-    # Target speed of 0 means brake
+    # 1차 제동 판단 (기존 로직 - 히트맵 기반 예측 속도 의존)
     brake = pred_target_speed < 0.01 or (speed / pred_target_speed) > self.config.brake_ratio
 
+    # 1차 조향 판단 (기존 로직)
     steer = self.lateral_pid_controller.step(pred_checkpoints, speed, ego_vehicle_location, ego_vehicle_rotation)
+
+    # ======================================================================
+    # [변경점 2] LiDAR 바운딩 박스(bboxes) 기반 강제 긴급 제동 및 회피 로직 추가
+    # ======================================================================
+    emergency_brake = False
+
+    if bboxes is not None:
+      # 현재 속도(m/s) 기준 안전 거리(TTC 2초 확보) + 최소 정차 보장 거리(4.5m)
+      safe_dist_front = max(4.5, speed * 2.0)
+
+      for bbox in bboxes:
+        obj_x = bbox[0] # 내 차 기준 전/후 거리 (양수: 앞)
+        obj_y = bbox[1] # 내 차 기준 좌/우 거리 (양수: 우측, 음수: 좌측)
+
+        # (1) 전방 충돌 방지: 내 차선(y ±1.5m) 안, 안전 거리(safe_dist_front) 내에 객체가 있으면 강제 제동
+        if 0 < obj_x < safe_dist_front and abs(obj_y) < 1.5:
+          emergency_brake = True
+
+        # (2) 사각지대/차선변경 충돌 방지
+        is_in_blind_spot = (-3.0 < obj_x < 2.0) # 차체 옆 ~ 살짝 뒤 사각지대
+        is_left_lane = (-3.5 < obj_y < -1.0)
+        is_right_lane = (1.0 < obj_y < 3.5)
+
+        if is_in_blind_spot:
+          # 좌측 사각지대에 차가 있는데 핸들을 좌측(steer < -0.1)으로 꺾으려 할 때
+          if is_left_lane and steer < -0.1:
+            emergency_brake = True
+            steer = max(0.0, steer) # 조향 취소 (0.0으로 덮어씀)
+          
+          # 우측 사각지대에 차가 있는데 핸들을 우측(steer > 0.1)으로 꺾으려 할 때
+          elif is_right_lane and steer > 0.1:
+            emergency_brake = True
+            steer = min(0.0, steer) # 조향 취소 (0.0으로 덮어씀)
+
+    # 긴급 제동 플래그가 켜졌다면, 기존 히트맵 판단(brake)을 무시하고 강제 정지
+    if emergency_brake:
+      brake = True
+      pred_target_speed = 0.0
+    # ======================================================================
+
     throttle, control_brake = get_throttle(self.config, brake, pred_target_speed, speed)
 
     throttle = np.clip(throttle, 0.0, self.config.clip_throttle)

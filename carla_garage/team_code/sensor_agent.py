@@ -1042,7 +1042,12 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     if self.config.inference_direct_controller and self.config.use_controller_input_prediction:
       pred_checkpoints = torch.stack(pred_checkpoints, dim=0).mean(dim=0).detach().cpu().numpy()
-      steer, throttle, brake = self.nets[0].control_pid_direct(pred_checkpoints, pred_target_speed_scalar, gt_velocity)
+      steer, throttle, brake = self.nets[0].control_pid_direct(
+    pred_checkpoints,
+    pred_target_speed_scalar,
+    gt_velocity,
+    bboxes=bbs_vehicle_coordinate_system
+)
     elif self.config.use_wp_gru and not self.config.inference_direct_controller:
       steer, throttle, brake = self.nets[0].control_pid(self.pred_wp,
                                                         gt_velocity,
