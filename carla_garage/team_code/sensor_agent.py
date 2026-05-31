@@ -91,6 +91,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     self.step = -1
     self.initialized = False
+    self.stop_mode_active_prev = False
+    self.stop_mode_zero_until = None
     self.device = torch.device('cpu' if self.force_cpu else 'cuda:0')
     print('Evaluation device: ', self.device)
 
@@ -1012,7 +1014,14 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       if self.config.use_mode_prediction and len(pred_modes) > 0:
         pred_mode_ensemble = torch.stack(pred_modes, dim=0).mean(dim=0)
         stop_threshold = getattr(self.config, 'mode_stop_threshold', 0.5)
-        if pred_mode_ensemble[0].item() >= stop_threshold:
+        stop_mode_active = pred_mode_ensemble[0].item() >= stop_threshold
+        if stop_mode_active and not self.stop_mode_active_prev:
+          current_game_time = float(timestamp) if timestamp is not None else self.step * self.config.carla_frame_rate
+          self.stop_mode_zero_until = current_game_time + 2.0
+        self.stop_mode_active_prev = stop_mode_active
+
+        current_game_time = float(timestamp) if timestamp is not None else self.step * self.config.carla_frame_rate
+        if self.stop_mode_zero_until is not None and current_game_time < self.stop_mode_zero_until:
           pred_target_speed_scalar = self.inference_target_speeds[0]
     else:
       pred_target_speed_scalar = None

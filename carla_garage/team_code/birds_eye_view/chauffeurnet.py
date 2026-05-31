@@ -7,6 +7,7 @@ import numpy as np
 import carla
 from gym import spaces
 import cv2 as cv
+import math
 from collections import deque
 from pathlib import Path
 import h5py
@@ -51,6 +52,7 @@ class ObsManager(ObsManagerBase):
     self._width = int(obs_configs['width_in_pixels'])
     self._pixels_ev_to_bottom = obs_configs['pixels_ev_to_bottom']
     self._pixels_per_meter = obs_configs['pixels_per_meter']
+    self._map_pixels_per_meter = self._pixels_per_meter
     self._history_idx = obs_configs['history_idx']
     self._scale_bbox = obs_configs.get('scale_bbox', True)
     self._scale_mask_col = obs_configs.get('scale_mask_col', 1.1)
@@ -83,6 +85,7 @@ class ObsManager(ObsManagerBase):
     self.vehicle = vehicle
     self._world = self.vehicle.get_world()
     self.criteria_stop = criteria_stop
+    self._map_pixels_per_meter = self._pixels_per_meter
 
     # splitting because for Town13 the name is 'Carla/Maps/Town13/Town13' instead of 'Town13'
     maps_h5_path = self._map_dir / (self._world.get_map().name.split('/')[-1] + '.h5')
@@ -103,12 +106,41 @@ class ObsManager(ObsManagerBase):
         print(self._pixels_per_meter, float(hf.attrs['pixels_per_meter']))
       assert np.isclose(self._pixels_per_meter, float(hf.attrs['pixels_per_meter']))
 
+    self._downsample_oversized_map()
     self._distance_threshold = np.ceil(self._width / self._pixels_per_meter)
     # dilate road mask, lbc draw road polygon with 10px boarder
     # kernel = np.ones((11, 11), np.uint8)
     # self._road = cv.dilate(self._road, kernel, iterations=1)
 
     TrafficLightHandler.reset(self._world)
+
+  @staticmethod
+  def _downsample_binary_mask(mask, factor):
+    height, width = mask.shape
+    pooled_height = height // factor
+    pooled_width = width // factor
+    if pooled_height == 0 or pooled_width == 0:
+      return mask
+
+    mask = mask[:pooled_height * factor, :pooled_width * factor]
+    mask = mask.reshape(pooled_height, factor, pooled_width, factor)
+    return mask.max(axis=(1, 3)).astype(np.uint8)
+
+  def _downsample_oversized_map(self):
+    # OpenCV remap/warpAffine requires source and destination dimensions below SHRT_MAX.
+    max_opencv_size = np.iinfo(np.int16).max
+    map_height, map_width = self._road.shape
+    largest_dimension = max(map_height, map_width)
+    if largest_dimension < max_opencv_size:
+      return
+
+    downsample_factor = int(math.ceil(largest_dimension / (max_opencv_size - 1)))
+    self._road = self._downsample_binary_mask(self._road, downsample_factor)
+    self._lane_marking_all = self._downsample_binary_mask(self._lane_marking_all, downsample_factor)
+    self._lane_marking_white_broken = self._downsample_binary_mask(self._lane_marking_white_broken,
+                                                                   downsample_factor)
+    self._sidewalk = self._downsample_binary_mask(self._sidewalk, downsample_factor)
+    self._map_pixels_per_meter = self._pixels_per_meter / downsample_factor
 
   @staticmethod
   def _get_stops(criteria_stop):
@@ -345,13 +377,19 @@ class ObsManager(ObsManagerBase):
   def _get_warp_transform(self, ev_loc, ev_rot):
     ev_loc_in_px = self._world_to_pixel(ev_loc)
     yaw = np.deg2rad(ev_rot.yaw)
+    map_scale = self._map_pixels_per_meter / self._pixels_per_meter
 
     forward_vec = np.array([np.cos(yaw), np.sin(yaw)])
     right_vec = np.array([np.cos(yaw + 0.5 * np.pi), np.sin(yaw + 0.5 * np.pi)])
 
-    bottom_left = ev_loc_in_px - self._pixels_ev_to_bottom * forward_vec - (0.5 * self._width) * right_vec
-    top_left = ev_loc_in_px + (self._width - self._pixels_ev_to_bottom) * forward_vec - (0.5 * self._width) * right_vec
-    top_right = ev_loc_in_px + (self._width - self._pixels_ev_to_bottom) * forward_vec + (0.5 * self._width) * right_vec
+    pixels_ev_to_bottom = self._pixels_ev_to_bottom * map_scale
+    width_in_map_pixels = self._width * map_scale
+
+    bottom_left = ev_loc_in_px - pixels_ev_to_bottom * forward_vec - (0.5 * width_in_map_pixels) * right_vec
+    top_left = ev_loc_in_px + (width_in_map_pixels - pixels_ev_to_bottom) * forward_vec \
+        - (0.5 * width_in_map_pixels) * right_vec
+    top_right = ev_loc_in_px + (width_in_map_pixels - pixels_ev_to_bottom) * forward_vec \
+        + (0.5 * width_in_map_pixels) * right_vec
 
     src_pts = np.stack((bottom_left, top_left, top_right), axis=0).astype(np.float32)
     dst_pts = np.array([[0, self._width - 1], [0, 0], [self._width - 1, 0]], dtype=np.float32)
@@ -359,8 +397,8 @@ class ObsManager(ObsManagerBase):
 
   def _world_to_pixel(self, location, projective=False):
     """Converts the world coordinates to pixel coordinates"""
-    x = self._pixels_per_meter * (location.x - self._world_offset[0])
-    y = self._pixels_per_meter * (location.y - self._world_offset[1])
+    x = self._map_pixels_per_meter * (location.x - self._world_offset[0])
+    y = self._map_pixels_per_meter * (location.y - self._world_offset[1])
 
     if projective:
       p = np.array([x, y, 1], dtype=np.float32)
@@ -370,7 +408,7 @@ class ObsManager(ObsManagerBase):
 
   def _world_to_pixel_width(self, width):
     """Converts the world units to pixel units"""
-    return self._pixels_per_meter * width
+    return self._map_pixels_per_meter * width
 
   def clean(self):
     self.vehicle = None

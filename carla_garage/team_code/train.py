@@ -236,6 +236,11 @@ def main():
                       default=int(config.freeze_backbone),
                       help='Freezes the encoder and auxiliary heads. Should be used when loading a already trained '
                       'model. Can be used for fine-tuning or multi-stage training.')
+  parser.add_argument('--freeze_except_mode_prediction_network',
+                      type=int,
+                      default=int(config.freeze_except_mode_prediction_network),
+                      help='Freezes all model layers except the mode prediction head. Requires '
+                      '--use_mode_prediction 1.')
   parser.add_argument('--learn_multi_task_weights',
                       type=int,
                       default=int(config.learn_multi_task_weights),
@@ -433,6 +438,12 @@ def main():
   config.initialize(**vars(args))
 
   config.debug = int(os.environ.get('DEBUG_CHALLENGE', 0))
+  if config.freeze_except_mode_prediction_network:
+    if not config.use_mode_prediction:
+      raise ValueError('--freeze_except_mode_prediction_network requires --use_mode_prediction 1.')
+    if config.use_plant:
+      raise ValueError('--freeze_except_mode_prediction_network is only supported for sensor models.')
+
   # Before normalizing we need to set the losses we don't use to 0
   if config.use_plant:
     config.detailed_loss_weights['loss_semantic'] = 0.0
@@ -481,7 +492,7 @@ def main():
     config.detailed_loss_weights['loss_velocity'] = 0.0
     config.detailed_loss_weights['loss_brake'] = 0.0
 
-  if config.freeze_backbone:
+  if config.freeze_backbone or config.freeze_except_mode_prediction_network:
     config.detailed_loss_weights['loss_semantic'] = 0.0
     config.detailed_loss_weights['loss_bev_semantic'] = 0.0
     config.detailed_loss_weights['loss_depth'] = 0.0
@@ -492,8 +503,13 @@ def main():
     config.detailed_loss_weights['loss_yaw_res'] = 0.0
     config.detailed_loss_weights['loss_velocity'] = 0.0
     config.detailed_loss_weights['loss_brake'] = 0.0
+    if config.freeze_except_mode_prediction_network:
+      config.detailed_loss_weights['loss_wp'] = 0.0
+      config.detailed_loss_weights['loss_target_speed'] = 0.0
+      config.detailed_loss_weights['loss_checkpoint'] = 0.0
+      config.detailed_loss_weights['loss_selection'] = 0.0
 
-  if config.multi_wp_output:
+  if config.multi_wp_output and not config.freeze_except_mode_prediction_network:
     config.detailed_loss_weights['loss_selection'] = 1.0
 
   if args.learn_multi_task_weights:
@@ -556,6 +572,10 @@ def main():
       start_epoch = int(''.join(filter(str.isdigit, load_name))) + 1
     model.load_state_dict(torch.load(args.load_file, map_location=device), strict=False)
 
+  if config.freeze_except_mode_prediction_network:
+    model.requires_grad_(False)
+    model.mode_head.requires_grad_(True)
+
   if config.freeze_backbone:
     model.backbone.requires_grad_(False)
 
@@ -585,8 +605,13 @@ def main():
 
   if config.use_optim_groups:
     params = model.module.create_optimizer_groups(config.weight_decay)
+    params = [{
+        **group,
+        'params': [param for param in group['params'] if param.requires_grad],
+    } for group in params]
+    params = [group for group in params if len(group['params']) > 0]
   else:
-    params = model.parameters()
+    params = filter(lambda p: p.requires_grad, model.parameters())
 
   if args.compile:
     model = torch.compile(model, mode=args.compile_mode)
@@ -598,7 +623,8 @@ def main():
   else:
     optimizer = optim.AdamW(params, lr=args.lr, amsgrad=True)
 
-  if not args.load_file is None and not config.freeze_backbone and args.continue_epoch:
+  if (not args.load_file is None and not config.freeze_backbone and
+      not config.freeze_except_mode_prediction_network and args.continue_epoch):
     optimizer.load_state_dict(torch.load(args.load_file.replace('model_', 'optimizer_'), map_location=device))
 
   model_parameters = filter(lambda p: p.requires_grad, model.parameters())
@@ -666,7 +692,8 @@ def main():
     milestones = [args.schedule_reduce_epoch_01, args.schedule_reduce_epoch_02]
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=config.multi_step_lr_decay)
   scaler = torch.amp.GradScaler(device, enabled=bool(config.use_amp))
-  if not args.load_file is None and not config.freeze_backbone:
+  if (not args.load_file is None and not config.freeze_backbone and
+      not config.freeze_except_mode_prediction_network):
     if args.continue_epoch:
       scheduler.load_state_dict(torch.load(args.load_file.replace('model_', 'scheduler_'), map_location=device))
       scaler.load_state_dict(torch.load(args.load_file.replace('model_', 'scaler_'), map_location=device))
@@ -956,6 +983,9 @@ class Engine(object):
 
   def train(self):
     self.model.train()
+    if self.config.freeze_except_mode_prediction_network:
+      self.model.module.eval()
+      self.model.module.mode_head.train()
 
     num_batches = 0
     loss_epoch = 0.0
