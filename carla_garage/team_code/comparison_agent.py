@@ -284,7 +284,7 @@ class ComparisonAgent(SensorAgent):
   def _save_vision_task_data(self, tick_data, lidar_bev, pred_semantic, pred_bev_semantic, pred_depth, pred_bb):
     super()._save_vision_task_data(tick_data, lidar_bev, pred_semantic, pred_bev_semantic, pred_depth, pred_bb)
 
-    if self.save_path is None or not self.collect_sensor_data or not self.vision_task_visualization:
+    if self.save_path is None or not self.collect_sensor_data:
       return
     if self.step % self.attention_save_freq != 0:
       return
@@ -303,12 +303,11 @@ class ComparisonAgent(SensorAgent):
     box_2d_overlay_path = self.vision_task_gt_paths['box_2d_overlay']
 
     metrics = {}
-    
-    rgb_image = self._tensor_rgb_to_numpy(tick_data['rgb'])
     boxes_2d = tick_data.get('2d_box', [])
     with open(box_2d_path / f'{frame_id}.json', 'w', encoding='utf-8') as outfile:
       ujson.dump({'boxes': boxes_2d}, outfile, indent=2)
-    if boxes_2d:
+    if self.vision_task_visualization and boxes_2d:
+      rgb_image = self._tensor_rgb_to_numpy(tick_data['rgb'])
       cv2.imwrite(str(box_2d_overlay_path / f'{frame_id}.png'), self._draw_2d_boxes(rgb_image, boxes_2d))
 
     if 'gt_semantic' in tick_data:
@@ -316,9 +315,10 @@ class ComparisonAgent(SensorAgent):
       converter = np.array(self.config.converter, dtype=np.uint8)
       gt_semantic = converter[np.clip(gt_semantic_raw, 0, len(converter) - 1)]
       np.savez_compressed(semantic_path / f'{frame_id}.npz', semantic=gt_semantic, semantic_raw=gt_semantic_raw)
-      palette = np.array(self.config.classes_list, dtype=np.uint8)
-      gt_semantic_image = palette[np.clip(gt_semantic, 0, len(palette) - 1)]
-      cv2.imwrite(str(semantic_path / f'{frame_id}.png'), gt_semantic_image)
+      if self.vision_task_visualization:
+        palette = np.array(self.config.classes_list, dtype=np.uint8)
+        gt_semantic_image = palette[np.clip(gt_semantic, 0, len(palette) - 1)]
+        cv2.imwrite(str(semantic_path / f'{frame_id}.png'), gt_semantic_image)
 
       if pred_semantic is not None:
         pred_semantic_indices = torch.argmax(pred_semantic[0], dim=0).detach().cpu().numpy().astype(np.uint8)
@@ -341,9 +341,10 @@ class ComparisonAgent(SensorAgent):
       converter = np.array(self.config.bev_converter, dtype=np.uint8)
       gt_bev_semantic = converter[np.clip(gt_bev_semantic_raw, 0, len(converter) - 1)]
       np.savez_compressed(bev_semantic_path / f'{frame_id}.npz', bev_semantic=gt_bev_semantic)
-      converter = np.array(self.config.bev_classes_list, dtype=np.uint8)
-      gt_bev_image = converter[np.clip(gt_bev_semantic, 0, len(converter) - 1)]
-      cv2.imwrite(str(bev_semantic_path / f'{frame_id}.png'), cv2.cvtColor(gt_bev_image, cv2.COLOR_RGB2BGR))
+      if self.vision_task_visualization:
+        converter = np.array(self.config.bev_classes_list, dtype=np.uint8)
+        gt_bev_image = converter[np.clip(gt_bev_semantic, 0, len(converter) - 1)]
+        cv2.imwrite(str(bev_semantic_path / f'{frame_id}.png'), cv2.cvtColor(gt_bev_image, cv2.COLOR_RGB2BGR))
 
       if pred_bev_semantic is not None:
         pred_bev_indices = torch.argmax(pred_bev_semantic[0], dim=0).detach().cpu().numpy().astype(np.uint8)
@@ -364,7 +365,8 @@ class ComparisonAgent(SensorAgent):
     if 'gt_depth' in tick_data:
       gt_depth = tick_data['gt_depth']
       np.savez_compressed(depth_path / f'{frame_id}.npz', depth=gt_depth)
-      cv2.imwrite(str(depth_path / f'{frame_id}.png'), cv2.applyColorMap(gt_depth, cv2.COLORMAP_TURBO))
+      if self.vision_task_visualization:
+        cv2.imwrite(str(depth_path / f'{frame_id}.png'), cv2.applyColorMap(gt_depth, cv2.COLORMAP_TURBO))
 
       if pred_depth is not None:
         pred_depth_image = pred_depth[0].detach().float().cpu().numpy()
@@ -383,7 +385,7 @@ class ComparisonAgent(SensorAgent):
 
   def _init_vision_task_gt_paths(self):
     self.vision_task_gt_paths = None
-    if self.save_path is None or not self.collect_sensor_data or not self.vision_task_visualization:
+    if self.save_path is None or not self.collect_sensor_data:
       return
     
     gt_path = pathlib.Path(self.save_path) / 'sensor_data' / 'vision_tasks_gt'
