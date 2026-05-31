@@ -991,6 +991,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       self.pred_wp = torch.stack(pred_wps, dim=0).mean(dim=0)
 
     # calculate target speed scalar from model predictions
+    pred_mode_ensemble = None
     if self.config.use_controller_input_prediction:
       pred_target_speed_ensemble = torch.stack(pred_target_speeds,
                                                dim=0).mean(dim=0)  # average across ensemble models' prediction
@@ -1044,6 +1045,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
           pred_depth=pred_depth,
           pred_checkpoint=pred_checkpoint,
           pred_speed=prob_target_speed,
+          pred_mode=pred_mode_ensemble,
           pred_target_speed_scalar=pred_target_speed_scalar,
           pred_bb=bbs_vehicle_coordinate_system,
           gt_speed=gt_velocity,

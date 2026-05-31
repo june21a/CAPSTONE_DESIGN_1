@@ -719,6 +719,7 @@ class LidarCenterNet(nn.Module):
       pred_depth=None,
       pred_checkpoint=None,
       pred_speed=None,
+      pred_mode=None,
       pred_target_speed_scalar=None,
       pred_bb=None,
       gt_wp=None,
@@ -904,6 +905,33 @@ class LidarCenterNet(nn.Module):
     if pred_speed is not None:
       pred_speed = pred_speed.detach().cpu().numpy()[0]
       t_u.draw_probability_boxes(images_lidar, pred_speed, self.config.target_speeds)
+
+    if pred_mode is not None:
+      if isinstance(pred_mode, tuple):
+        pred_mode = pred_mode[1]
+      if torch.is_tensor(pred_mode):
+        pred_mode = pred_mode.detach().cpu().numpy()
+      pred_mode = np.asarray(pred_mode).squeeze()
+      if pred_mode.ndim > 1:
+        pred_mode = pred_mode[0]
+
+      if pred_mode.size >= 2:
+        stop_prob = float(pred_mode[0])
+        go_prob = float(pred_mode[1])
+        mode_idx = int(np.argmax(pred_mode[:2]))
+        mode_text = 'STOP' if mode_idx == 0 else 'GO'
+        mode_color = (255, 0, 0) if mode_idx == 0 else (0, 160, 0)
+
+        cv2.putText(images_lidar, f'MODE: {mode_text}', (10, 630), cv2.FONT_HERSHEY_SIMPLEX, 1, mode_color, 2,
+                    cv2.LINE_AA)
+        cv2.putText(images_lidar, f'Stop: {stop_prob:.2f}  Go: {go_prob:.2f}', (10, 600),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 1, cv2.LINE_AA)
+      else:
+        mode_idx = int(round(float(pred_mode.item())))
+        mode_text = 'STOP' if mode_idx == 0 else 'GO'
+        mode_color = (255, 0, 0) if mode_idx == 0 else (0, 160, 0)
+        cv2.putText(images_lidar, f'MODE: {mode_text}', (10, 630), cv2.FONT_HERSHEY_SIMPLEX, 1, mode_color, 2,
+                    cv2.LINE_AA)
 
     if gt_speed is not None:
       gt_speed_float = gt_speed[0].detach().cpu().item()

@@ -944,6 +944,7 @@ class Engine(object):
                         pred_depth=pred_depth,
                         pred_checkpoint=pred_checkpoint,
                         pred_speed=F.softmax(pred_target_speed, dim=1) if pred_target_speed is not None else None,
+                        pred_mode=pred_mode,
                         pred_bb=pred_bounding_box,
                         gt_wp=ego_waypoint,
                         gt_bbs=bounding_box_label,
