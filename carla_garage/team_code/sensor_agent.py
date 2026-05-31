@@ -486,7 +486,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       ujson.dump(metadata, outfile, indent=2)
 
   def _save_vision_task_data(self, tick_data, lidar_bev, pred_semantic, pred_bev_semantic, pred_depth, pred_bb):
-    if self.save_path is None or not self.collect_sensor_data or not self.vision_task_visualization:
+    if self.save_path is None or not self.collect_sensor_data:
       return
     if self.step % self.attention_save_freq != 0:
       return
@@ -502,44 +502,47 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     detection_path = self.vision_task_paths['detection']
 
     frame_id = f'{self.step:04}'
-    rgb_image = self._tensor_rgb_to_numpy(tick_data['rgb'])
 
     if pred_semantic is not None:
       semantic_indices = torch.argmax(pred_semantic[0], dim=0).detach().cpu().numpy().astype(np.uint8)
       np.savez_compressed(semantic_path / f'{frame_id}.npz', semantic=semantic_indices)
-      palette = np.array([
-          [0, 0, 0],
-          [70, 70, 70],
-          [100, 40, 40],
-          [55, 90, 80],
-          [220, 20, 60],
-          [153, 153, 153],
-          [157, 234, 50],
-      ], dtype=np.uint8)
-      semantic_image = palette[np.clip(semantic_indices, 0, len(palette) - 1)]
-      semantic_image = cv2.resize(semantic_image,
-                                  dsize=(rgb_image.shape[1], rgb_image.shape[0]),
-                                  interpolation=cv2.INTER_NEAREST)
-      semantic_overlay = cv2.addWeighted(cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR), 0.55,
-                                         cv2.cvtColor(semantic_image, cv2.COLOR_RGB2BGR), 0.45, 0)
-      cv2.imwrite(str(semantic_path / f'{frame_id}.png'), semantic_overlay)
+      if self.vision_task_visualization:
+        rgb_image = self._tensor_rgb_to_numpy(tick_data['rgb'])
+        palette = np.array([
+            [0, 0, 0],
+            [70, 70, 70],
+            [100, 40, 40],
+            [55, 90, 80],
+            [220, 20, 60],
+            [153, 153, 153],
+            [157, 234, 50],
+        ], dtype=np.uint8)
+        semantic_image = palette[np.clip(semantic_indices, 0, len(palette) - 1)]
+        semantic_image = cv2.resize(semantic_image,
+                                    dsize=(rgb_image.shape[1], rgb_image.shape[0]),
+                                    interpolation=cv2.INTER_NEAREST)
+        semantic_overlay = cv2.addWeighted(cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR), 0.55,
+                                           cv2.cvtColor(semantic_image, cv2.COLOR_RGB2BGR), 0.45, 0)
+        cv2.imwrite(str(semantic_path / f'{frame_id}.png'), semantic_overlay)
 
     if pred_bev_semantic is not None:
       bev_indices = torch.argmax(pred_bev_semantic[0], dim=0).detach().cpu().numpy().astype(np.uint8)
       np.savez_compressed(bev_semantic_path / f'{frame_id}.npz', bev_semantic=bev_indices)
-      converter = np.array(self.config.bev_classes_list, dtype=np.uint8)
-      bev_image = converter[np.clip(bev_indices, 0, len(converter) - 1)]
-      cv2.imwrite(str(bev_semantic_path / f'{frame_id}.png'), cv2.cvtColor(bev_image, cv2.COLOR_RGB2BGR))
+      if self.vision_task_visualization:
+        converter = np.array(self.config.bev_classes_list, dtype=np.uint8)
+        bev_image = converter[np.clip(bev_indices, 0, len(converter) - 1)]
+        cv2.imwrite(str(bev_semantic_path / f'{frame_id}.png'), cv2.cvtColor(bev_image, cv2.COLOR_RGB2BGR))
 
     if pred_depth is not None:
       depth = pred_depth[0].detach().float().cpu().numpy()
       np.savez_compressed(depth_path / f'{frame_id}.npz', depth=depth)
-      depth = depth - np.min(depth)
-      max_depth = np.max(depth)
-      if max_depth > 1e-6:
-        depth = depth / max_depth
-      depth_uint8 = (depth * 255).astype(np.uint8)
-      cv2.imwrite(str(depth_path / f'{frame_id}.png'), cv2.applyColorMap(depth_uint8, cv2.COLORMAP_TURBO))
+      if self.vision_task_visualization:
+        depth = depth - np.min(depth)
+        max_depth = np.max(depth)
+        if max_depth > 1e-6:
+          depth = depth / max_depth
+        depth_uint8 = (depth * 255).astype(np.uint8)
+        cv2.imwrite(str(depth_path / f'{frame_id}.png'), cv2.applyColorMap(depth_uint8, cv2.COLORMAP_TURBO))
 
     if pred_bb is not None:
       boxes = np.asarray(pred_bb, dtype=np.float32)
@@ -563,41 +566,42 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
             'detections': detections,
         }, outfile, indent=2)
 
-      lidar_image = 255 - (lidar_bev.detach().cpu().numpy()[0][0] * 255).astype(np.uint8)
-      lidar_image = np.stack([lidar_image, lidar_image, lidar_image], axis=-1)
-      scale_factor = 4
-      lidar_image = cv2.resize(lidar_image,
-                               dsize=(lidar_image.shape[1] * scale_factor, lidar_image.shape[0] * scale_factor),
-                               interpolation=cv2.INTER_NEAREST)
-      loc_pixels_per_meter = self.config.pixels_per_meter * scale_factor
-      color_classes = [
-          np.array([255, 165, 0]),
-          np.array([0, 255, 0]),
-          np.array([255, 0, 0]),
-          np.array([250, 160, 160]),
-          np.array([16, 133, 133])
-      ]
-      boxes_are_image_system = False
-      if boxes.size > 0:
-        metric_limit = max(abs(self.config.min_x), abs(self.config.max_x), abs(self.config.min_y),
-                           abs(self.config.max_y))
-        boxes_are_image_system = np.any(np.abs(boxes[:, :2]) > metric_limit * 2.0)
-      for box in boxes:
-        inv_brake = 1.0 - box[6]
-        color_box = deepcopy(color_classes[int(box[7]) % len(color_classes)])
-        color_box[1] = color_box[1] * inv_brake
-        if boxes_are_image_system:
-          box_image = box.copy()
-        else:
-          box_image = t_u.bb_vehicle_to_image_system(box.copy(), loc_pixels_per_meter, self.config.min_x,
-                                                     self.config.min_y)
-        lidar_image = t_u.draw_box(lidar_image, box_image, color=color_box, pixel_per_meter=loc_pixels_per_meter)
-      lidar_image = np.rot90(lidar_image, k=1)
-      cv2.imwrite(str(detection_path / f'{frame_id}.png'), np.ascontiguousarray(lidar_image, dtype=np.uint8))
+      if self.vision_task_visualization:
+        lidar_image = 255 - (lidar_bev.detach().cpu().numpy()[0][0] * 255).astype(np.uint8)
+        lidar_image = np.stack([lidar_image, lidar_image, lidar_image], axis=-1)
+        scale_factor = 4
+        lidar_image = cv2.resize(lidar_image,
+                                 dsize=(lidar_image.shape[1] * scale_factor, lidar_image.shape[0] * scale_factor),
+                                 interpolation=cv2.INTER_NEAREST)
+        loc_pixels_per_meter = self.config.pixels_per_meter * scale_factor
+        color_classes = [
+            np.array([255, 165, 0]),
+            np.array([0, 255, 0]),
+            np.array([255, 0, 0]),
+            np.array([250, 160, 160]),
+            np.array([16, 133, 133])
+        ]
+        boxes_are_image_system = False
+        if boxes.size > 0:
+          metric_limit = max(abs(self.config.min_x), abs(self.config.max_x), abs(self.config.min_y),
+                             abs(self.config.max_y))
+          boxes_are_image_system = np.any(np.abs(boxes[:, :2]) > metric_limit * 2.0)
+        for box in boxes:
+          inv_brake = 1.0 - box[6]
+          color_box = deepcopy(color_classes[int(box[7]) % len(color_classes)])
+          color_box[1] = color_box[1] * inv_brake
+          if boxes_are_image_system:
+            box_image = box.copy()
+          else:
+            box_image = t_u.bb_vehicle_to_image_system(box.copy(), loc_pixels_per_meter, self.config.min_x,
+                                                       self.config.min_y)
+          lidar_image = t_u.draw_box(lidar_image, box_image, color=color_box, pixel_per_meter=loc_pixels_per_meter)
+        lidar_image = np.rot90(lidar_image, k=1)
+        cv2.imwrite(str(detection_path / f'{frame_id}.png'), np.ascontiguousarray(lidar_image, dtype=np.uint8))
 
   def _init_vision_task_paths(self):
     self.vision_task_paths = None
-    if self.save_path is None or not self.collect_sensor_data or not self.vision_task_visualization:
+    if self.save_path is None or not self.collect_sensor_data:
       return
 
     vision_path = pathlib.Path(self.save_path) / 'sensor_data' / 'vision_tasks'
