@@ -12,7 +12,10 @@ import numpy as np
 try:
     import cv2
 except ImportError as exc:
-    raise SystemExit("OpenCV is required. Run this with the same Python environment used for CARLA evaluation.") from exc
+    cv2 = None
+    CV2_IMPORT_ERROR = exc
+else:
+    CV2_IMPORT_ERROR = None
 
 
 SEMANTIC_PALETTE_BGR = np.array(
@@ -71,16 +74,45 @@ MAX_X = 32.0
 MIN_Y = -32.0
 MAX_Y = 32.0
 PIXELS_PER_METER = 4.0
+DEFAULT_RESULTS_ROOT = Path(__file__).resolve().parents[1] / "carla_garage" / "results"
+RESTORE_TARGET_NAMES = (
+    "semantic",
+    "gt_semantic",
+    "bev_semantic",
+    "depth",
+    "rgb_attention",
+    "lidar_attention",
+    "detection",
+    "2d_box_overlay",
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Regenerate visualization PNGs from NPZ files in a CARLA route result folder."
+        description="Regenerate visualization PNGs from saved NPZ/JSON files in CARLA result folders."
     )
     parser.add_argument(
         "route_folder",
+        nargs="?",
         type=Path,
-        help="Route folder, or its sensor_data folder.",
+        help="Optional route folder, or its sensor_data folder. If omitted, use --exp-name.",
+    )
+    parser.add_argument(
+        "--results-root",
+        type=Path,
+        default=DEFAULT_RESULTS_ROOT,
+        help="Results directory containing experiment folders. Defaults to carla_garage/results.",
+    )
+    parser.add_argument(
+        "--exp-name",
+        help="Experiment folder under results-root to process, or 'all' for every experiment.",
+    )
+    parser.add_argument(
+        "--target",
+        nargs="+",
+        default=["all"],
+        choices=["all", *RESTORE_TARGET_NAMES],
+        help="Visualization target(s) to restore. Defaults to all.",
     )
     parser.add_argument(
         "--overwrite",
@@ -95,6 +127,28 @@ def sensor_data_root(route_folder: Path) -> Path:
     if route_folder.name == "sensor_data":
         return route_folder
     return route_folder / "sensor_data"
+
+
+def experiment_roots(results_root: Path, exp_name: str) -> list[Path]:
+    if exp_name == "all":
+        return sorted(path for path in results_root.iterdir() if path.is_dir())
+    return [results_root / exp_name]
+
+
+def sensor_data_roots_from_experiment(results_root: Path, exp_name: str) -> list[Path]:
+    roots: list[Path] = []
+    for exp_root in experiment_roots(results_root, exp_name):
+        if not exp_root.is_dir():
+            print(f"Experiment folder does not exist: {exp_root}")
+            continue
+        roots.extend(sorted(path / "sensor_data" for path in exp_root.iterdir() if (path / "sensor_data").is_dir()))
+    return roots
+
+
+def selected_target_names(requested_targets: list[str]) -> list[str]:
+    if "all" in requested_targets:
+        return list(RESTORE_TARGET_NAMES)
+    return requested_targets
 
 
 def should_write(path: Path, overwrite: bool) -> bool:
@@ -343,23 +397,60 @@ def restore_2d_box_overlays(sensor_root: Path, overwrite: bool) -> int:
     return count
 
 
+RESTORE_TARGETS = {
+    "semantic": restore_semantic_predictions,
+    "gt_semantic": restore_gt_semantics,
+    "bev_semantic": restore_bev_semantics,
+    "depth": restore_depth,
+    "rgb_attention": restore_rgb_attention,
+    "lidar_attention": restore_lidar_attention,
+    "detection": restore_detection,
+    "2d_box_overlay": restore_2d_box_overlays,
+}
+
+
+def resolve_sensor_roots(args: argparse.Namespace) -> list[Path]:
+    if args.route_folder is not None and args.exp_name is not None:
+        raise ValueError("Use either a route_folder positional argument or --exp-name, not both.")
+    if args.route_folder is not None:
+        return [sensor_data_root(args.route_folder)]
+    if args.exp_name is None:
+        raise ValueError("Provide a route_folder or --exp-name. Use --exp-name all to process every experiment.")
+
+    results_root = args.results_root.expanduser().resolve()
+    if not results_root.exists():
+        raise ValueError(f"Results root does not exist: {results_root}")
+    if not results_root.is_dir():
+        raise ValueError(f"Results root is not a directory: {results_root}")
+    return sensor_data_roots_from_experiment(results_root, args.exp_name)
+
+
 def main() -> int:
     args = parse_args()
-    sensor_root = sensor_data_root(args.route_folder)
-    if not sensor_root.is_dir():
-        print(f"sensor_data folder does not exist: {sensor_root}")
+    if cv2 is None:
+        print("OpenCV is required. Run this with the same Python environment used for CARLA evaluation.")
         return 1
 
-    counts = {
-        "semantic": restore_semantic_predictions(sensor_root, args.overwrite),
-        "gt_semantic": restore_gt_semantics(sensor_root, args.overwrite),
-        "bev_semantic": restore_bev_semantics(sensor_root, args.overwrite),
-        "depth": restore_depth(sensor_root, args.overwrite),
-        "rgb_attention": restore_rgb_attention(sensor_root, args.overwrite),
-        "lidar_attention": restore_lidar_attention(sensor_root, args.overwrite),
-        "detection": restore_detection(sensor_root, args.overwrite),
-        "2d_box_overlay": restore_2d_box_overlays(sensor_root, args.overwrite),
-    }
+    try:
+        sensor_roots = resolve_sensor_roots(args)
+    except ValueError as exc:
+        print(exc)
+        return 1
+
+    missing_roots = [sensor_root for sensor_root in sensor_roots if not sensor_root.is_dir()]
+    if missing_roots:
+        for sensor_root in missing_roots:
+            print(f"sensor_data folder does not exist: {sensor_root}")
+        return 1
+    if not sensor_roots:
+        print(f"No sensor_data folders found for exp-name={args.exp_name!r} under {args.results_root.expanduser().resolve()}")
+        return 1
+
+    counts = dict.fromkeys(selected_target_names(args.target), 0)
+    for sensor_root in sensor_roots:
+        print(f"Restoring: {sensor_root}")
+        for name in counts:
+            counts[name] += RESTORE_TARGETS[name](sensor_root, args.overwrite)
 
     for name, count in counts.items():
         print(f"{name}: restored {count} image(s)")
