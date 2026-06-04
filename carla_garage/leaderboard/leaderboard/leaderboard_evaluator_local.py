@@ -334,6 +334,7 @@ class LeaderboardEvaluator(object):
                 self.agent_instance = agent_class_obj(args.agent_config, config.index)
             else:
                 self.agent_instance = agent_class_obj(args.agent_config, route_date_string)
+            self.agent_instance.use_heuristic = args.use_heuristic
 
             self.agent_instance.set_global_plan(self.route_scenario.gps_route, self.route_scenario.route)
             self.agent_instance.setup(args.agent_config, route_date_string, self.traffic_manager)
@@ -503,6 +504,8 @@ def main():
                         help="Path to checkpoint used for saving statistics and resuming")
     parser.add_argument("--debug-checkpoint", type=str, default='./live_results.txt',
                         help="Path to checkpoint used for saving live results")
+    parser.add_argument('--use_heuristic', type=int, default=0,
+                        help='Use heuristic for STOP mode: make ego vehicle target speed 0 for 2 seconds when STOP mode is predicted')
 
     arguments = parser.parse_args()
 

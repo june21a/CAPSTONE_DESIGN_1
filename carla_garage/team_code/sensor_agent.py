@@ -819,7 +819,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     return result
 
   @torch.inference_mode()  # Turns off gradient computation
-  def run_step(self, input_data, timestamp, sensors=None):  # pylint: disable=locally-disabled, unused-argument
+  def run_step(self, input_data, timestamp, sensors=None, use_heuristic=False):  # pylint: disable=locally-disabled, unused-argument
     self.step += 1
 
     if not self.initialized:
@@ -1014,17 +1014,20 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       if self.config.use_mode_prediction and len(pred_modes) > 0:
         pred_mode_ensemble = torch.stack(pred_modes, dim=0).mean(dim=0)
         stop_threshold = getattr(self.config, 'mode_stop_threshold', 0.5)
-        # stop_mode_active = pred_mode_ensemble[0].item() >= stop_threshold
-        # if stop_mode_active and not self.stop_mode_active_prev:
-        #   current_game_time = float(timestamp) if timestamp is not None else self.step * self.config.carla_frame_rate
-        #   self.stop_mode_zero_until = current_game_time + 2.0
-        # self.stop_mode_active_prev = stop_mode_active
+        
+        if use_heuristic:
+          stop_mode_active = pred_mode_ensemble[0].item() >= stop_threshold
+          if stop_mode_active and not self.stop_mode_active_prev:
+            current_game_time = float(timestamp) if timestamp is not None else self.step * self.config.carla_frame_rate
+            self.stop_mode_zero_until = current_game_time + 2.0
+          self.stop_mode_active_prev = stop_mode_active
 
-        # current_game_time = float(timestamp) if timestamp is not None else self.step * self.config.carla_frame_rate
-        # if self.stop_mode_zero_until is not None and current_game_time < self.stop_mode_zero_until:
-        #   pred_target_speed_scalar = self.inference_target_speeds[0]
-        if pred_mode_ensemble[0].item() >= stop_threshold:
-          pred_target_speed_scalar = self.inference_target_speeds[0]
+          current_game_time = float(timestamp) if timestamp is not None else self.step * self.config.carla_frame_rate
+          if self.stop_mode_zero_until is not None and current_game_time < self.stop_mode_zero_until:
+            pred_target_speed_scalar = self.inference_target_speeds[0]
+        else:
+          if pred_mode_ensemble[0].item() >= stop_threshold:
+            pred_target_speed_scalar = self.inference_target_speeds[0]
         
     else:
       pred_target_speed_scalar = None
