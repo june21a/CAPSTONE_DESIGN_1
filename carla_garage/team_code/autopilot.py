@@ -122,6 +122,8 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     self.plan_safety_label_frames = {}
     self.plan_safety_any_disturbed = False
     self.plan_safety_case_label = self.sim_case_label
+    self.plan_safety_unsafe_label = int(os.environ.get("PLAN_SAFETY_UNSAFE_LABEL", 0))
+    self.plan_safety_safe_label = int(os.environ.get("PLAN_SAFETY_SAFE_LABEL", 1))
     self.junction = False
     self.aim_wp = None  # Waypoint the expert is steering towards
     self.remaining_route = None  # Remaining route
@@ -1107,7 +1109,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         "waypoints": measurement.get("route", [])[:self.config.pred_len],
         "target_speed": round(float(target_speed), 4),
         "expert_target_speed": round(float(measurement.get("expert_target_speed", target_speed)), 4),
-        "will_collide": 0,
+        "will_collide": self.plan_safety_safe_label,
         "sim_disturbed": bool(measurement.get("sim_disturbed", False)),
         "sim_disturbance_reason": measurement.get("sim_disturbance_reason"),
     }]
@@ -1153,13 +1155,13 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         continue
       for candidate in candidates:
         unsafe = unsafe_start_frame is not None and unsafe_start_frame <= frame < collision_data_frame
-        candidate["will_collide"] = int(unsafe)
+        candidate["will_collide"] = self.plan_safety_unsafe_label if unsafe else self.plan_safety_safe_label
       labeled_frames[frame_key] = candidates
 
     labels = {
         "label_map": {
-            "safe": 0,
-            "unsafe_sim_collision": 1
+            "unsafe_sim_collision": self.plan_safety_unsafe_label,
+            "safe": self.plan_safety_safe_label
         },
         "source": "carla_autopilot",
         "case_label": self.plan_safety_case_label,

@@ -76,7 +76,7 @@ class AutonomousAgent(object):
 
         return sensors
 
-    def run_step(self, input_data, timestamp):
+    def run_step(self, input_data, timestamp, sensors=None, use_heuristic=False):
         """
         Execute one step of navigation.
         :return: control
@@ -114,7 +114,7 @@ class AutonomousAgent(object):
         print('=== [Agent] -- Wallclock = {} -- System time = {} -- Game time = {} -- Ratio = {}x'.format(
             str(wallclock)[:-3], format(wallclock_diff, '.3f'), format(timestamp, '.3f'), format(sim_ratio, '.3f')))
 
-        control = self.run_step(input_data, timestamp, sensors)
+        control = self.run_step(input_data, timestamp, sensors, use_heuristic=getattr(self, 'use_heuristic', False))
         control.manual_gear_shift = False
 
         return control

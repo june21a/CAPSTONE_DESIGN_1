@@ -73,6 +73,8 @@ def make_run_pair(route_file: Path, output_root: Path, carla_garage_root: Path, 
             "SIM_FAILURE_DISTURB": "1" if disturb else "0",
             "SIM_FAILURE_STOP_AFTER_COLLISION": "1",
             "SIM_FAILURE_COLLISION_TAIL_SECONDS": "10" if disturb else "0",
+            "PLAN_SAFETY_UNSAFE_LABEL": "0",
+            "PLAN_SAFETY_SAFE_LABEL": "1",
         }
         exports = " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
         return (
