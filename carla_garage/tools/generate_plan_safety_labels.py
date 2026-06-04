@@ -4,8 +4,8 @@
 The output is one ``plan_safety_labels.json.gz`` file per route folder.
 Each frame contains candidate plans with:
 
-  will_collide = 0  # safe
-  will_collide = 1  # unsafe / collision predicted by offline OBB overlap
+  will_collide = 0  # unsafe / collision predicted by offline OBB overlap
+  will_collide = 1  # safe
 
 This is an offline approximation. For guaranteed labels, replay candidate plans in
 CARLA and use simulator collision events.
@@ -483,7 +483,7 @@ def make_candidates(
             "variant": variant,
             "waypoints": waypoints.round(4).tolist(),
             "target_speed": round(float(target_speed), 4),
-            "will_collide": int(will_collide),
+            "will_collide": 0 if will_collide else 1,
             "other_boxes": np.asarray(other_boxes, dtype=np.float32).round(4).tolist(),
             "other_velocities": np.asarray(other_velocities, dtype=np.float32).round(4).tolist(),
         })
@@ -560,14 +560,14 @@ def label_route(
         if candidates:
             frame_key = f"{frame:04}"
             frames[frame_key] = candidates
-            safe_count += sum(1 for candidate in candidates if not candidate["will_collide"])
-            unsafe_count += sum(1 for candidate in candidates if candidate["will_collide"])
+            unsafe_count += sum(1 for candidate in candidates if candidate["will_collide"] == 0)
+            safe_count += sum(1 for candidate in candidates if candidate["will_collide"] == 1)
 
     if frames:
         dump_json_gz(
             output_path,
             {
-                "label_map": {"safe": 0, "unsafe_will_collide": 1},
+                "label_map": {"unsafe_will_collide": 0, "safe": 1},
                 "pred_len": pred_len,
                 "dt": dt,
                 "frames": frames,
@@ -621,8 +621,8 @@ def main() -> int:
 
     print(f"Scanned routes: {route_count}")
     print(f"Labeled frames: {frame_count}")
-    print(f"safe=0: {safe_count}")
-    print(f"unsafe_will_collide=1: {unsafe_count}")
+    print(f"unsafe_will_collide=0: {unsafe_count}")
+    print(f"safe=1: {safe_count}")
     return 0
 
 

@@ -61,8 +61,20 @@ class LidarCenterNet(nn.Module):
       self.head = LidarCenterNetHead(self.config)
 
     if self.config.use_mode_prediction:
-      self.mode_head = ModePredictionHead(self.backbone.num_features)
-      self.loss_mode = nn.CrossEntropyLoss(label_smoothing=0.0)
+      if self.config.mode_prediction_type == 'stop_move':
+        self.mode_head = ModePredictionHead(self.backbone.num_features)
+      elif self.config.mode_prediction_type == 'plan_safety':
+        self.mode_head = PlanSafetyModePredictionHead(
+            in_channels=self.backbone.num_features,
+            hidden_dim=self.config.plan_safety_hidden_dim,
+            dropout=self.config.plan_safety_dropout)
+      else:
+        raise ValueError(f'Unknown mode_prediction_type: {self.config.mode_prediction_type}')
+      if self.config.mode_prediction_type == 'plan_safety':
+        mode_loss_weights = torch.tensor(self.config.plan_safety_loss_weights, dtype=torch.float32)
+        self.loss_mode = FocalLoss(alpha=mode_loss_weights, gamma=self.config.focal_loss_gamma)
+      else:
+        self.loss_mode = FocalLoss(gamma=self.config.focal_loss_gamma)
 
     if self.config.use_semantic:
       self.semantic_decoder = t_u.PerspectiveDecoder(
@@ -291,7 +303,13 @@ class LidarCenterNet(nn.Module):
       return None
     return feature_grid.detach().abs().mean(dim=1)
 
-  def forward(self, rgb, lidar_bev, target_point, ego_vel, command, target_point_next=None):
+  def forward(self,
+              rgb,
+              lidar_bev,
+              target_point,
+              ego_vel,
+              command,
+              target_point_next=None):
     bs = rgb.shape[0]
     self.latest_attention_map = None
     self.latest_rgb_attention_map = None
@@ -308,6 +326,7 @@ class LidarCenterNet(nn.Module):
     else:
       raise ValueError('The chosen vision backbone does not exist. '
                        'The options are: transFuser, aim, bev_encoder')
+    mode_scene_features = fused_features
 
     pred_wp = None
     pred_target_speed = None
@@ -316,7 +335,7 @@ class LidarCenterNet(nn.Module):
     pred_wp_1 = None
     selected_path = None
     mode = None
-    if self.config.use_mode_prediction:
+    if self.config.use_mode_prediction and self.config.mode_prediction_type == 'stop_move':
       mode = self.mode_head(fused_features)
 
     if self.config.use_wp_gru or self.config.use_controller_input_prediction:
@@ -411,6 +430,9 @@ class LidarCenterNet(nn.Module):
           else:
             pred_target_speed = self.target_speed_network(target_speed_features)
 
+    if self.config.use_mode_prediction and self.config.mode_prediction_type == 'plan_safety':
+      mode = self.mode_head(mode_scene_features)
+
     # Auxiliary tasks
     pred_semantic = None
     if self.config.use_semantic:
@@ -446,7 +468,7 @@ class LidarCenterNet(nn.Module):
                    avg_factor_label, pred_mode=None, mode_label=None):
     loss = {}
     if self.config.use_mode_prediction:
-      mode_logits, _ = pred_mode
+      mode_logits, _ = pred_mode[:2]
       loss_mode = self.loss_mode(mode_logits, mode_label)
       loss.update({'loss_mode': loss_mode})
 
@@ -496,6 +518,10 @@ class LidarCenterNet(nn.Module):
       loss.update(loss_bbox)
 
     return loss
+
+  def _target_speed_scalar_from_logits(self, pred_target_speed):
+    target_speeds = pred_target_speed.new_tensor(self.config.target_speeds).view(1, -1)
+    return torch.sum(F.softmax(pred_target_speed, dim=1) * target_speeds, dim=1, keepdim=True)
 
   def convert_features_to_bb_metric(self, bb_predictions):
     bboxes = self.head.get_bboxes(bb_predictions[0], bb_predictions[1], bb_predictions[2], bb_predictions[3],
@@ -916,20 +942,32 @@ class LidarCenterNet(nn.Module):
         pred_mode = pred_mode[0]
 
       if pred_mode.size >= 2:
-        stop_prob = float(pred_mode[0])
-        go_prob = float(pred_mode[1])
         mode_idx = int(np.argmax(pred_mode[:2]))
-        mode_text = 'STOP' if mode_idx == 0 else 'GO'
-        mode_color = (255, 0, 0) if mode_idx == 0 else (0, 160, 0)
+        if self.config.mode_prediction_type == 'plan_safety':
+          unsafe_prob = float(pred_mode[0])
+          safe_prob = float(pred_mode[1])
+          mode_text = 'UNSAFE' if mode_idx == 0 else 'SAFE'
+          mode_color = (255, 0, 0) if mode_idx == 0 else (0, 160, 0)
+          mode_prob_text = f'Safe: {safe_prob:.2f}  Unsafe: {unsafe_prob:.2f}'
+        else:
+          stop_prob = float(pred_mode[0])
+          go_prob = float(pred_mode[1])
+          mode_text = 'STOP' if mode_idx == 0 else 'GO'
+          mode_color = (255, 0, 0) if mode_idx == 0 else (0, 160, 0)
+          mode_prob_text = f'Stop: {stop_prob:.2f}  Go: {go_prob:.2f}'
 
         cv2.putText(images_lidar, f'MODE: {mode_text}', (10, 630), cv2.FONT_HERSHEY_SIMPLEX, 1, mode_color, 2,
                     cv2.LINE_AA)
-        cv2.putText(images_lidar, f'Stop: {stop_prob:.2f}  Go: {go_prob:.2f}', (10, 600),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.putText(images_lidar, mode_prob_text, (10, 600), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 1,
+                    cv2.LINE_AA)
       else:
         mode_idx = int(round(float(pred_mode.item())))
-        mode_text = 'STOP' if mode_idx == 0 else 'GO'
-        mode_color = (255, 0, 0) if mode_idx == 0 else (0, 160, 0)
+        if self.config.mode_prediction_type == 'plan_safety':
+          mode_text = 'UNSAFE' if mode_idx == 0 else 'SAFE'
+          mode_color = (255, 0, 0) if mode_idx == 0 else (0, 160, 0)
+        else:
+          mode_text = 'STOP' if mode_idx == 0 else 'GO'
+          mode_color = (255, 0, 0) if mode_idx == 0 else (0, 160, 0)
         cv2.putText(images_lidar, f'MODE: {mode_text}', (10, 630), cv2.FONT_HERSHEY_SIMPLEX, 1, mode_color, 2,
                     cv2.LINE_AA)
 
@@ -1105,3 +1143,45 @@ class ModePredictionHead(nn.Module):
         mode_prob = F.softmax(mode_logits, dim=1)
 
         return mode_logits, mode_prob
+
+
+class PlanSafetyModePredictionHead(nn.Module):
+  """
+  Scene-only plan safety mode head.
+
+  Inputs:
+    fused_feature:       (B, C, H, W) or (B, C), from the perception backbone
+  Output:
+    mode_logits:         (B, 2), class 0=unsafe/will_collide, 1=safe
+    mode_prob:           (B, 2)
+  """
+
+  def __init__(self,
+               in_channels,
+               hidden_dim=256,
+               dropout=0.1):
+    super().__init__()
+    self.gap = nn.AdaptiveAvgPool2d((1, 1))
+    self.classifier = nn.Sequential(
+        nn.Linear(in_channels, hidden_dim),
+        nn.ReLU(inplace=True),
+        nn.Dropout(dropout),
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.ReLU(inplace=True),
+        nn.Dropout(dropout),
+        nn.Linear(hidden_dim, 2),
+    )
+
+  def forward(self, fused_feature):
+    if fused_feature.ndim == 4:
+      x = self.gap(fused_feature)
+      x = torch.flatten(x, 1)
+    elif fused_feature.ndim == 2:
+      x = fused_feature
+    else:
+      raise ValueError(f'PlanSafetyModePredictionHead expects 2D or 4D features, got {fused_feature.shape}')
+
+    mode_logits = self.classifier(x)
+    mode_prob = F.softmax(mode_logits, dim=1)
+
+    return mode_logits, mode_prob

@@ -379,11 +379,25 @@ def main():
   parser.add_argument('--use_mode_prediction',
                       type=int,
                       default=int(config.use_mode_prediction),
-                      help='Whether to train and run the stop/move mode prediction head.')
+                      help='Whether to train and run a mode prediction head.')
+  parser.add_argument('--mode_prediction_type',
+                      type=str,
+                      choices=('stop_move', 'plan_safety'),
+                      default=str(config.mode_prediction_type),
+                      help='Mode prediction head type. stop_move keeps the original head; plan_safety judges plans.')
   parser.add_argument('--mode_stop_threshold',
                       type=float,
                       default=float(config.mode_stop_threshold),
                       help='Stop probability threshold used by inference when mode prediction is enabled.')
+  parser.add_argument('--plan_safety_labeled_frames_only',
+                      type=int,
+                      default=int(config.plan_safety_labeled_frames_only),
+                      help='For plan_safety mode, train only frames listed in plan_safety_labels.json.gz.')
+  parser.add_argument('--plan_safety_loss_weights',
+                      type=float,
+                      nargs=2,
+                      default=config.plan_safety_loss_weights,
+                      help='Class weights [unsafe, safe] for plan_safety mode focal loss.')
 
   args = parser.parse_args()
   args.logdir = os.path.join(args.logdir, args.id)
@@ -831,7 +845,6 @@ class Engine(object):
       mode_label = data['mode_label'].to(self.device, dtype=torch.long)
     else:
       mode_label = None
-
     # Load model specific data and execute model
     if self.config.use_plant:
       checkpoint = data['route'][:, :self.config.num_route_points].to(self.device, dtype=torch.float32)
@@ -882,7 +895,7 @@ class Engine(object):
                           target_point=target_point,
                           ego_vel=ego_vel,
                           command=command,
-                          target_point_next=target_point_next if self.config.two_tp_input else None,)
+                          target_point_next=target_point_next if self.config.two_tp_input else None)
     else:
       raise ValueError('The chosen vision backbone does not exist. The options are: transFuser, aim, bev_encoder')
 

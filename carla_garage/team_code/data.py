@@ -57,6 +57,7 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
     self.boxes = []
     self.future_boxes = []
     self.mode_labels = []
+    self.plan_safety_labels = []
     self.measurements = []
     self.sample_start = []
 
@@ -107,7 +108,12 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
         condition3 = results_route['status'] == 'Failed'
         condition4 = results_route['status'] == 'Failed - Simulation crashed'
         condition5 = results_route['status'] == 'Failed - Agent crashed'
-        if condition1 or condition2 or condition3 or condition4 or condition5:
+        allow_failed_driving_route = bool(self.config.freeze_except_mode_prediction_network and condition3)
+        if condition2 or condition4 or condition5:
+          continue
+        if condition3 and allow_failed_driving_route:
+          pass
+        elif condition1 or condition3:
           continue
 
         trainable_routes += 1
@@ -117,6 +123,19 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
           skipped_routes += 1
           continue
         num_seq = len(os.listdir(lidar_dir))
+        plan_safety_labeled_frames = None
+        if (self.config.use_mode_prediction and self.config.mode_prediction_type == 'plan_safety' and
+            getattr(self.config, 'plan_safety_labeled_frames_only', False)):
+          plan_safety_label_path = route_dir + '/plan_safety_labels.json.gz'
+          if not os.path.isfile(plan_safety_label_path):
+            skipped_routes += 1
+            continue
+          with gzip.open(plan_safety_label_path, 'rt', encoding='utf-8') as f:
+            plan_safety_labels_i = ujson.load(f)
+          plan_safety_labeled_frames = set(plan_safety_labels_i.get('frames', {}).keys())
+          if not plan_safety_labeled_frames:
+            skipped_routes += 1
+            continue
 
         # If we are using checkpoints to predict the path, we can use all of the frames, otherwise we need to subtract
         # pred_len so that we have enough waypoint labels
@@ -124,6 +143,10 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
         for seq in range(config.skip_first, last_frame):
           if seq % config.train_sampling_rate != 0:
             continue
+          if plan_safety_labeled_frames is not None:
+            frame_key = f'{seq + self.config.seq_len - 1:04}'
+            if frame_key not in plan_safety_labeled_frames:
+              continue
 
           # load input seq and pred seq jointly
           image = []
@@ -201,6 +224,7 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
           self.boxes.append(box)
           self.future_boxes.append(future_box)
           self.mode_labels.append(route_dir + '/mode_labels.json.gz')
+          self.plan_safety_labels.append(route_dir + '/plan_safety_labels.json.gz')
           self.measurements.append(measurement)
           self.sample_start.append(seq)
 
@@ -259,6 +283,7 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
     self.boxes = np.array(self.boxes).astype(np.string_)
     self.future_boxes = np.array(self.future_boxes).astype(np.string_)
     self.mode_labels = np.array(self.mode_labels).astype(np.string_)
+    self.plan_safety_labels = np.array(self.plan_safety_labels).astype(np.string_)
     self.measurements = np.array(self.measurements).astype(np.string_)
 
     self.temporal_lidars = np.array(self.temporal_lidars).astype(np.string_)
@@ -293,6 +318,7 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
     boxes = self.boxes[index]
     future_boxes = self.future_boxes[index]
     mode_labels = self.mode_labels[index]
+    plan_safety_labels = self.plan_safety_labels[index]
     measurements = self.measurements[index]
     sample_start = self.sample_start[index]
 
@@ -528,7 +554,11 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
 
     current_measurement = loaded_measurements[self.config.seq_len - 1]
     if self.config.use_mode_prediction:
-      mode_label_file = str(mode_labels, encoding='utf-8')
+      if self.config.mode_prediction_type == 'plan_safety':
+        mode_label_file = str(plan_safety_labels, encoding='utf-8')
+      else:
+        mode_label_file = str(mode_labels, encoding='utf-8')
+
       if (not self.data_cache is None) and (mode_label_file in self.data_cache):
         mode_labels_i = self.data_cache[mode_label_file]
       elif os.path.isfile(mode_label_file):
@@ -540,7 +570,9 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
         mode_labels_i = None
 
       frame_key = f'{sample_start + self.config.seq_len - 1:04}'
-      if mode_labels_i is not None and frame_key in mode_labels_i.get('frames', {}):
+      if self.config.mode_prediction_type == 'plan_safety':
+        self.add_plan_safety_sample(data, current_measurement, mode_labels_i, frame_key)
+      elif mode_labels_i is not None and frame_key in mode_labels_i.get('frames', {}):
         data['mode_label'] = int(mode_labels_i['frames'][frame_key])
       else:
         data['mode_label'] = int(not (current_measurement['brake'] or current_measurement['target_speed'] <= 0.1))
@@ -899,6 +931,23 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
       waypoints_aug.append(np.squeeze(waypoint_aug))
 
     return waypoints_aug
+
+  def add_plan_safety_sample(self, data, current_measurement, plan_safety_labels, frame_key):
+    """Add one candidate plan safety sample to the training item.
+
+    The label convention is:
+      mode_label 0 = unsafe / will collide
+      mode_label 1 = safe
+    """
+    candidates = None
+    if plan_safety_labels is not None:
+      candidates = plan_safety_labels.get('frames', {}).get(frame_key)
+
+    if candidates:
+      candidate = random.choice(candidates)
+      data['mode_label'] = int(candidate['will_collide'])
+    else:
+      data['mode_label'] = 1
 
   def align(self, lidar_0, measurements_0, measurements_1, y_augmentation=0.0, yaw_augmentation=0):
     """

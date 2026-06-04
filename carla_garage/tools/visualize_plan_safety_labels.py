@@ -296,7 +296,8 @@ def render_frame(route_dir: Path, labels: dict, frame: str, candidate_index: int
     draw_box(image, box, color=tuple(int(channel) for channel in color), thickness=3,
              pixels_per_meter=loc_pixels_per_meter, min_y=min_y, max_x=max_x)
 
-  path_color = (0, 0, 255) if candidate.get("will_collide") else (0, 200, 0)
+  unsafe = is_unsafe_candidate(candidate, labels)
+  path_color = (0, 0, 255) if unsafe else (0, 200, 0)
   draw_waypoints(image, candidate.get("waypoints", []), path_color, loc_pixels_per_meter, min_y, max_x)
 
   measurement = load_measurement(route_dir, frame)
@@ -307,7 +308,7 @@ def render_frame(route_dir: Path, labels: dict, frame: str, candidate_index: int
     draw_target_point(image, measurement.get("target_point_next"), NEXT_TARGET_POINT_COLOR, loc_pixels_per_meter, min_y,
                       max_x)
 
-  label = "unsafe" if candidate.get("will_collide") else "safe"
+  label = "unsafe" if unsafe else "safe"
   pil_image = Image.fromarray(image)
   draw = ImageDraw.Draw(pil_image)
   draw.text((10, 10), f"{frame} candidate {candidate_index} {candidate.get('variant', '')} {label}", fill=path_color)
@@ -329,10 +330,16 @@ def iter_route_dirs(data_root: Path):
     yield labels_path.parent
 
 
+def is_unsafe_candidate(candidate: dict, labels: dict) -> bool:
+  label_map = labels.get("label_map", {})
+  unsafe_label = label_map.get("unsafe_sim_collision", label_map.get("unsafe_will_collide", 1))
+  return int(candidate.get("will_collide", 0)) == int(unsafe_label)
+
+
 def unsafe_frames(labels: dict) -> list[str]:
   frames = []
   for frame, candidates in labels.get("frames", {}).items():
-    if any(candidate.get("will_collide") for candidate in candidates):
+    if any(is_unsafe_candidate(candidate, labels) for candidate in candidates):
       frames.append(frame)
   return sorted(frames)
 
@@ -384,7 +391,7 @@ def render_route(route_dir: Path, args: argparse.Namespace) -> int:
     candidate_indices = range(len(labels["frames"][frame])) if args.all_candidates else [args.candidate]
     for candidate_index in candidate_indices:
       if args.list_frames:
-        unsafe = any(candidate.get("will_collide") for candidate in labels["frames"][frame])
+        unsafe = any(is_unsafe_candidate(candidate, labels) for candidate in labels["frames"][frame])
         label = "unsafe" if unsafe else "safe"
         print(f"{route_dir} frame={frame} candidate={candidate_index} {label}")
         rendered += 1

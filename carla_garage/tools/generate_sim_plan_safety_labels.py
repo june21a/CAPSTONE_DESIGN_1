@@ -168,7 +168,7 @@ def candidate_from_measurement(measurement: dict[str, Any], pred_len: int, unsaf
         "waypoints": waypoints,
         "target_speed": round(float(target_speed), 4),
         "expert_target_speed": round(float(measurement.get("expert_target_speed", target_speed)), 4),
-        "will_collide": int(unsafe),
+        "will_collide": 0 if unsafe else 1,
     }
 
 
@@ -268,7 +268,7 @@ def label_route(
         return 0, 0, 0, unresolved_collision, False
 
     dump_json_gz(output_path, {
-        "label_map": {"safe": 0, "unsafe_sim_collision": 1},
+        "label_map": {"unsafe_sim_collision": 0, "safe": 1},
         "source": "carla_simulator",
         "case_label": case_label,
         "route_had_collision": collision,
@@ -363,8 +363,8 @@ def main() -> int:
 
     print(f"Labeled routes: {route_count}")
     print(f"Labeled frames: {frame_count}")
-    print(f"safe=0: {safe_count}")
-    print(f"unsafe_sim_collision=1: {unsafe_count}")
+    print(f"safe=1: {safe_count}")
+    print(f"unsafe_sim_collision=0: {unsafe_count}")
     print(f"Skipped existing label files: {skipped_existing_count}")
     print(f"collision routes without usable collision frame: {unresolved_collision_count}")
     return 0
