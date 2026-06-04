@@ -11,6 +11,7 @@ It must not be modified and is for reference only!
 """
 
 from __future__ import print_function
+import os
 import signal
 import sys
 import time
@@ -21,6 +22,7 @@ import threading
 
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 from srunner.scenariomanager.timer import GameTime
+from srunner.scenariomanager.traffic_events import TrafficEventType
 from srunner.scenariomanager.watchdog import Watchdog
 
 from leaderboard.autoagents.agent_wrapper import AgentWrapperFactory, AgentError
@@ -71,6 +73,7 @@ class ScenarioManager(object):
         self._watchdog = None
         self._agent_watchdog = None
         self._scenario_thread = None
+        self._post_collision_end_time = None
 
         self._statistics_manager = statistics_manager
 
@@ -116,6 +119,7 @@ class ScenarioManager(object):
         self.ego_vehicles = scenario.ego_vehicles
         self.other_actors = scenario.other_actors
         self.repetition_number = rep_number
+        self._post_collision_end_time = None
 
         self._spectator = CarlaDataProvider.get_world().get_spectator()
 
@@ -218,12 +222,37 @@ class ScenarioManager(object):
                 py_trees.display.print_ascii_tree(self.scenario_tree, show_status=True)
                 sys.stdout.flush()
 
-            if self.scenario_tree.status != py_trees.common.Status.RUNNING:
+            if self._post_collision_end_time is None and self._should_keep_recording_after_collision():
+                self._post_collision_end_time = timestamp.elapsed_seconds + float(
+                    os.environ.get("SIM_FAILURE_COLLISION_TAIL_SECONDS", 10.0))
+                print("Collision detected; recording for {:.1f} more simulator seconds.".format(
+                    self._post_collision_end_time - timestamp.elapsed_seconds))
+
+            if self._post_collision_end_time is not None and timestamp.elapsed_seconds >= self._post_collision_end_time:
+                self._running = False
+            elif self.scenario_tree.status != py_trees.common.Status.RUNNING:
                 self._running = False
 
             ego_trans = self.ego_vehicles[0].get_transform()
             self._spectator.set_transform(carla.Transform(ego_trans.location + carla.Location(z=70),
                                                           carla.Rotation(pitch=-90)))
+
+    def _should_keep_recording_after_collision(self):
+        if int(os.environ.get("SIM_FAILURE_STOP_AFTER_COLLISION", 0)) != 1:
+            return False
+        if self.scenario is None:
+            return False
+
+        collision_types = {
+            TrafficEventType.COLLISION_STATIC,
+            TrafficEventType.COLLISION_VEHICLE,
+            TrafficEventType.COLLISION_PEDESTRIAN,
+        }
+        for criterion in self.scenario.get_criteria():
+            for event in getattr(criterion, "events", []):
+                if event.get_type() in collision_types:
+                    return True
+        return False
 
     def get_running_status(self):
         """

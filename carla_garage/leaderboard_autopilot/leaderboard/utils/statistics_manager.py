@@ -13,6 +13,7 @@ from __future__ import print_function
 
 from dictor import dictor
 import math
+import os
 
 from srunner.scenariomanager.traffic_events import TrafficEventType
 
@@ -357,6 +358,8 @@ class StatisticsManager(object):
         route_record.meta['route_length'] = self._route_length
         route_record.meta['duration_game'] = round(duration_time_game, ROUND_DIGITS)
         route_record.meta['duration_system'] = round(duration_time_system, ROUND_DIGITS)
+        route_record.meta['collision_frame'] = None
+        route_record.meta['collision_data_frame'] = None
 
         # Update the route infractions
         if self._scenario:
@@ -366,6 +369,17 @@ class StatisticsManager(object):
 
             for node in self._scenario.get_criteria():
                 for event in node.events:
+                    if event.get_type() in (
+                            TrafficEventType.COLLISION_STATIC,
+                            TrafficEventType.COLLISION_PEDESTRIAN,
+                            TrafficEventType.COLLISION_VEHICLE):
+                        collision_frame = event.get_frame()
+                        if (route_record.meta['collision_frame'] is None or
+                                collision_frame < route_record.meta['collision_frame']):
+                            data_save_freq = int(os.environ.get('DATA_SAVE_FREQ', 10))
+                            route_record.meta['collision_frame'] = collision_frame
+                            route_record.meta['collision_data_frame'] = collision_frame // data_save_freq
+
                     # Traffic events that substract a set amount of points
                     if event.get_type() in PENALTY_VALUE_DICT:
                         score_penalty *= PENALTY_VALUE_DICT[event.get_type()]

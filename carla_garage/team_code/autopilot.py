@@ -110,6 +110,18 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     self.traffic_light_hazard = False
     self.walker_hazard = False
     self.vehicle_hazard = False
+    self.sim_failure_enabled = int(os.environ.get("SIM_FAILURE_DISTURB", 0)) == 1
+    self.sim_case_label = os.environ.get("SIM_CASE_LABEL", "success")
+    self.sim_failure_min_speed = float(os.environ.get("SIM_FAILURE_MIN_SPEED", 8.0))
+    self.sim_failure_speed_factor = float(os.environ.get("SIM_FAILURE_SPEED_FACTOR", 1.8))
+    self.sim_failure_max_speed = float(os.environ.get("SIM_FAILURE_MAX_SPEED", 14.0))
+    self.sim_failure_lookahead = int(os.environ.get("SIM_FAILURE_LOOKAHEAD", 60))
+    self.sim_failure_active = False
+    self.sim_failure_reason = None
+    self.sim_failure_original_target_speed = None
+    self.plan_safety_label_frames = {}
+    self.plan_safety_any_disturbed = False
+    self.plan_safety_case_label = self.sim_case_label
     self.junction = False
     self.aim_wp = None  # Waypoint the expert is steering towards
     self.remaining_route = None  # Remaining route
@@ -376,6 +388,15 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
     target_speed = min(target_speed, target_speed_route_obstacle)
 
+    target_speed_expert = float(target_speed)
+    target_speed, disturbance_meta = self._maybe_disturb_target_speed(
+        target_speed=target_speed,
+        route_waypoints=route_wp,
+        next_traffic_light=next_traffic_light,
+        distance_to_next_traffic_light=distance_to_next_traffic_light)
+    if disturbance_meta["active"]:
+      brake = target_speed < 0.01
+
     # Determine if the ego vehicle is at a junction
     ego_vehicle_waypoint = self.world_map.get_waypoint(self._vehicle.get_location())
     self.junction = ego_vehicle_waypoint.is_junction
@@ -431,9 +452,79 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
       self.next_commands.append(next_far_command.value)
 
     driving_data = self.save(target_point, next_target_point, steer, throttle, brake, control_brake, target_speed,
-                             speed_limit, tick_data, speed_reduced_by_obj)
+                             speed_limit, tick_data, speed_reduced_by_obj, target_speed_expert, disturbance_meta)
 
     return control, driving_data
+
+  def _maybe_disturb_target_speed(self, target_speed, route_waypoints, next_traffic_light, distance_to_next_traffic_light):
+    """
+        Optionally force unsafe simulator rollouts by changing only the target speed.
+
+        This is disabled by default and is meant for collecting simulator-labeled
+        failure repetitions. Waypoints and lateral control are left untouched.
+    """
+    meta = {
+        "enabled": bool(self.sim_failure_enabled),
+        "active": False,
+        "reason": None,
+        "case_label": self.sim_case_label,
+        "original_target_speed": float(target_speed),
+        "disturbed_target_speed": float(target_speed),
+    }
+
+    self.sim_failure_active = False
+    self.sim_failure_reason = None
+    self.sim_failure_original_target_speed = float(target_speed)
+
+    if not self.sim_failure_enabled:
+      return target_speed, meta
+
+    if self._red_or_yellow_light_affects_ego(next_traffic_light, distance_to_next_traffic_light):
+      meta["reason"] = "blocked_by_signal"
+      return target_speed, meta
+
+    reason = self._disturbance_focus_reason(route_waypoints)
+    if reason is None:
+      return target_speed, meta
+
+    if target_speed < 0.5:
+      disturbed_target_speed = self.sim_failure_min_speed
+      reason = f"{reason}_force_move_from_stop"
+    else:
+      disturbed_target_speed = max(self.sim_failure_min_speed, target_speed * self.sim_failure_speed_factor)
+
+    disturbed_target_speed = min(disturbed_target_speed, self.sim_failure_max_speed)
+
+    meta.update({
+        "active": True,
+        "reason": reason,
+        "disturbed_target_speed": float(disturbed_target_speed),
+    })
+    self.sim_failure_active = True
+    self.sim_failure_reason = reason
+    return disturbed_target_speed, meta
+
+  def _red_or_yellow_light_affects_ego(self, next_traffic_light, distance_to_next_traffic_light):
+    if next_traffic_light is None:
+      return False
+    if not np.isfinite(distance_to_next_traffic_light):
+      return False
+    if distance_to_next_traffic_light > self.config.light_radius:
+      return False
+    return next_traffic_light.state in (carla.TrafficLightState.Red, carla.TrafficLightState.Yellow)
+
+  def _disturbance_focus_reason(self, route_waypoints):
+    lookahead = min(self.sim_failure_lookahead, len(route_waypoints))
+    for idx in range(lookahead):
+      if route_waypoints[idx].is_junction:
+        return "junction"
+
+    for idx in range(lookahead):
+      lane_change = route_waypoints[idx].lane_change
+      if str(lane_change) != "None":
+        return "lane_change"
+
+    return None
 
   def _manage_route_obstacle_scenarios(self, target_speed, ego_speed, route_waypoints, list_vehicles, route_points):
     """
@@ -879,7 +970,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     return target_speed, keep_driving, speed_reduced_by_obj
 
   def save(self, target_point, next_target_point, steering, throttle, brake, control_brake, target_speed, speed_limit,
-           tick_data, speed_reduced_by_obj):
+           tick_data, speed_reduced_by_obj, expert_target_speed=None, disturbance_meta=None):
     """
         Save the driving data for the current frame.
 
@@ -933,11 +1024,28 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
       if speed_reduced_by_obj_distance is not None:
         speed_reduced_by_obj_distance = float(speed_reduced_by_obj_distance)
 
+    if expert_target_speed is None:
+      expert_target_speed = target_speed
+    if disturbance_meta is None:
+      disturbance_meta = {
+          "enabled": False,
+          "active": False,
+          "reason": None,
+          "case_label": self.sim_case_label,
+          "original_target_speed": float(expert_target_speed),
+          "disturbed_target_speed": float(target_speed),
+      }
+
     data = {
         "pos_global": ego_position.tolist(),
         "theta": ego_orientation,
         "speed": ego_speed,
         "target_speed": target_speed,
+        "expert_target_speed": float(expert_target_speed),
+        "sim_case_label": disturbance_meta["case_label"],
+        "sim_disturbed": bool(disturbance_meta["active"]),
+        "sim_disturbance_reason": disturbance_meta["reason"],
+        "sim_disturbed_target_speed": float(disturbance_meta["disturbed_target_speed"]),
         "speed_limit": speed_limit,
         "target_point": ego_target_point,
         "target_point_next": ego_next_target_point,
@@ -982,8 +1090,87 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
       measurements_file = self.save_path / "measurements" / f"{frame:04}.json.gz"
       with gzip.open(measurements_file, "wt", encoding="utf-8") as f:
         ujson.dump(data, f, indent=4)
+      self._add_plan_safety_label_candidate(frame, data)
 
     return data
+
+  def _add_plan_safety_label_candidate(self, frame, measurement):
+    """Store a candidate plan label that can be finalized when route results are known."""
+    self.plan_safety_any_disturbed = self.plan_safety_any_disturbed or bool(measurement.get("sim_disturbed", False))
+    self.plan_safety_case_label = measurement.get("sim_case_label", self.plan_safety_case_label)
+    target_speed = measurement.get("sim_disturbed_target_speed", measurement.get("target_speed", 0.0))
+    if not measurement.get("sim_disturbed", False):
+      target_speed = measurement.get("target_speed", target_speed)
+
+    self.plan_safety_label_frames[f"{frame:04}"] = [{
+        "variant": measurement.get("sim_case_label", "simulator"),
+        "waypoints": measurement.get("route", [])[:self.config.pred_len],
+        "target_speed": round(float(target_speed), 4),
+        "expert_target_speed": round(float(measurement.get("expert_target_speed", target_speed)), 4),
+        "will_collide": 0,
+        "sim_disturbed": bool(measurement.get("sim_disturbed", False)),
+        "sim_disturbance_reason": measurement.get("sim_disturbance_reason"),
+    }]
+
+  def _results_have_collision(self, results):
+    if results is None:
+      return False
+    if isinstance(results, dict):
+      infractions = results.get("infractions", {})
+    else:
+      infractions = getattr(results, "infractions", {})
+    collision_keys = ("collisions_layout", "collisions_pedestrian", "collisions_vehicle")
+    return any(bool(infractions.get(key)) for key in collision_keys)
+
+  def _collision_data_frame_from_results(self, results):
+    if results is None:
+      return None
+    if isinstance(results, dict):
+      meta = results.get("meta", {})
+    else:
+      meta = getattr(results, "meta", {})
+    collision_frame = meta.get("collision_frame") if meta else None
+    if collision_frame is not None:
+      return int(collision_frame) // int(self.config.data_save_freq)
+    collision_data_frame = meta.get("collision_data_frame") if meta else None
+    if collision_data_frame is None:
+      return None
+    return int(collision_data_frame)
+
+  def _write_plan_safety_labels(self, results=None):
+    if self.save_path is None or not self.datagen or not self.plan_safety_label_frames:
+      return
+
+    route_had_collision = self._results_have_collision(results)
+    collision_data_frame = self._collision_data_frame_from_results(results)
+    unsafe_window_frames = 10
+    unsafe_start_frame = None if collision_data_frame is None else max(0, collision_data_frame - unsafe_window_frames)
+
+    labeled_frames = {}
+    for frame_key, candidates in self.plan_safety_label_frames.items():
+      frame = int(frame_key)
+      if collision_data_frame is not None and frame >= collision_data_frame:
+        continue
+      for candidate in candidates:
+        unsafe = unsafe_start_frame is not None and unsafe_start_frame <= frame < collision_data_frame
+        candidate["will_collide"] = int(unsafe)
+      labeled_frames[frame_key] = candidates
+
+    labels = {
+        "label_map": {
+            "safe": 0,
+            "unsafe_sim_collision": 1
+        },
+        "source": "carla_autopilot",
+        "case_label": self.plan_safety_case_label,
+        "route_had_collision": route_had_collision,
+        "collision_data_frame": collision_data_frame,
+        "unsafe_window_frames": unsafe_window_frames,
+        "pred_len": self.config.pred_len,
+        "frames": labeled_frames,
+    }
+    with gzip.open(self.save_path / "plan_safety_labels.json.gz", "wt", encoding="utf-8") as f:
+      ujson.dump(labels, f, indent=2)
 
   def destroy(self, results=None):
     """
@@ -994,6 +1181,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
             results (optional): Any additional results to be processed or saved.
         """
     if self.save_path is not None:
+      self._write_plan_safety_labels(results)
       self.lon_logger.dump_to_json()
 
       # Save the target speed histogram to a compressed JSON file
