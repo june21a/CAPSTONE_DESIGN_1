@@ -324,12 +324,105 @@ def render_frame(route_dir: Path, labels: dict, frame: str, candidate_index: int
   return output_path
 
 
+def iter_route_dirs(data_root: Path):
+  for labels_path in sorted(data_root.glob("**/plan_safety_labels.json.gz")):
+    yield labels_path.parent
+
+
+def unsafe_frames(labels: dict) -> list[str]:
+  frames = []
+  for frame, candidates in labels.get("frames", {}).items():
+    if any(candidate.get("will_collide") for candidate in candidates):
+      frames.append(frame)
+  return sorted(frames)
+
+
+def collision_window_frames(labels: dict, before: int, after: int) -> list[str]:
+  collision_frame = labels.get("collision_data_frame")
+  if collision_frame is None:
+    return []
+
+  available_frames = set(labels.get("frames", {}))
+  start = max(0, int(collision_frame) - before)
+  end = int(collision_frame) + after
+  return [f"{frame:04}" for frame in range(start, end + 1) if f"{frame:04}" in available_frames]
+
+
+def selected_frames(labels: dict, args: argparse.Namespace) -> list[str]:
+  frames = sorted(labels.get("frames", {}))
+  if not frames:
+    return []
+
+  if args.frame:
+    return [args.frame]
+  if args.collision_window:
+    frames = collision_window_frames(labels, args.frames_before_collision, args.frames_after_collision)
+  elif args.unsafe_only:
+    frames = unsafe_frames(labels)
+  elif not args.all_labeled:
+    frames = unsafe_frames(labels) or frames[:1]
+
+  if args.limit is not None:
+    frames = frames[:args.limit]
+  return frames
+
+
+def render_route(route_dir: Path, args: argparse.Namespace) -> int:
+  labels_path = route_dir / "plan_safety_labels.json.gz"
+  labels = load_json_gz(labels_path)
+  frames = selected_frames(labels, args)
+  if not frames:
+    print(f"No selected frames in {route_dir}")
+    return 0
+
+  output_dir = args.output_dir or route_dir / "plan_safety_visualizations"
+  rendered = 0
+  for frame in frames:
+    if frame not in labels["frames"]:
+      raise KeyError(f"Frame {frame} not found in {labels_path}. Available examples: {sorted(labels['frames'])[:10]}")
+
+    candidate_indices = range(len(labels["frames"][frame])) if args.all_candidates else [args.candidate]
+    for candidate_index in candidate_indices:
+      if args.list_frames:
+        unsafe = any(candidate.get("will_collide") for candidate in labels["frames"][frame])
+        label = "unsafe" if unsafe else "safe"
+        print(f"{route_dir} frame={frame} candidate={candidate_index} {label}")
+        rendered += 1
+        continue
+
+      output_path = render_frame(
+          route_dir=route_dir,
+          labels=labels,
+          frame=frame,
+          candidate_index=candidate_index,
+          output_dir=output_dir,
+          scale_factor=args.scale_factor,
+          pixels_per_meter=args.pixels_per_meter,
+          min_x=args.min_x,
+          max_x=args.max_x,
+          min_y=args.min_y,
+          max_y=args.max_y,
+          use_ground_plane=args.use_ground_plane,
+      )
+      print(output_path)
+      rendered += 1
+  return rendered
+
+
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument("route_dir", type=Path, help="Route folder containing plan_safety_labels.json.gz")
+  parser.add_argument("route_dir", type=Path, nargs="?", help="Route folder containing plan_safety_labels.json.gz")
+  parser.add_argument("--data-root", type=Path, help="Dataset root; renders routes containing unsafe labels.")
   parser.add_argument("--frame", help="Frame key, e.g. 0005. Defaults to the first labeled frame.")
   parser.add_argument("--candidate", type=int, default=0, help="Candidate index within the frame.")
   parser.add_argument("--all-candidates", action="store_true", help="Render every candidate for the selected frame.")
+  parser.add_argument("--unsafe-only", action="store_true", help="Render labeled unsafe/collision-imminent frames only.")
+  parser.add_argument("--collision-window", action="store_true", help="Render labeled frames around collision_data_frame.")
+  parser.add_argument("--frames-before-collision", type=int, default=10)
+  parser.add_argument("--frames-after-collision", type=int, default=0)
+  parser.add_argument("--all-labeled", action="store_true", help="Render all labeled frames.")
+  parser.add_argument("--limit", type=int, help="Maximum number of frames/routes to render.")
+  parser.add_argument("--list-frames", action="store_true", help="Print selected frames without rendering PNGs.")
   parser.add_argument("--output-dir", type=Path, help="Where to write PNGs.")
   parser.add_argument("--scale-factor", type=int, default=4)
   parser.add_argument("--pixels-per-meter", type=float, default=4.0)
@@ -343,34 +436,24 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
   args = parse_args()
-  labels_path = args.route_dir / "plan_safety_labels.json.gz"
-  labels = load_json_gz(labels_path)
-  frames = sorted(labels.get("frames", {}))
-  if not frames:
-    raise ValueError(f"No labeled frames found in {labels_path}")
+  if args.data_root is not None:
+    rendered_routes = 0
+    for route_dir in iter_route_dirs(args.data_root):
+      labels = load_json_gz(route_dir / "plan_safety_labels.json.gz")
+      if not unsafe_frames(labels):
+        continue
+      render_route(route_dir, args)
+      rendered_routes += 1
+      if args.limit is not None and rendered_routes >= args.limit:
+        break
+    if rendered_routes == 0:
+      raise ValueError(f"No routes with unsafe labels found under {args.data_root}")
+    return
 
-  frame = args.frame or frames[0]
-  if frame not in labels["frames"]:
-    raise KeyError(f"Frame {frame} not found. Available examples: {frames[:10]}")
+  if args.route_dir is None:
+    raise ValueError("Provide either route_dir or --data-root")
 
-  output_dir = args.output_dir or args.route_dir / "plan_safety_visualizations"
-  candidate_indices = range(len(labels["frames"][frame])) if args.all_candidates else [args.candidate]
-  for candidate_index in candidate_indices:
-    output_path = render_frame(
-        route_dir=args.route_dir,
-        labels=labels,
-        frame=frame,
-        candidate_index=candidate_index,
-        output_dir=output_dir,
-        scale_factor=args.scale_factor,
-        pixels_per_meter=args.pixels_per_meter,
-        min_x=args.min_x,
-        max_x=args.max_x,
-        min_y=args.min_y,
-        max_y=args.max_y,
-        use_ground_plane=args.use_ground_plane,
-    )
-    print(output_path)
+  render_route(args.route_dir, args)
 
 
 if __name__ == "__main__":

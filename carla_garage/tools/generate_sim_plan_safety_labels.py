@@ -12,6 +12,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from tqdm import tqdm
+
 
 COLLISION_KEYS = ("collisions_layout", "collisions_pedestrian", "collisions_vehicle")
 COLLISION_LOCATION_PATTERN = re.compile(
@@ -202,14 +204,14 @@ def label_route(
     safe_samples_per_unsafe: float,
     max_safe_per_non_collision_route: int,
     seed: int,
-) -> tuple[int, int, int, bool]:
+) -> tuple[int, int, int, bool, bool]:
     output_path = route_dir / "plan_safety_labels.json.gz"
     if output_path.exists() and not overwrite:
-        return 0, 0, 0, False
+        return 0, 0, 0, False, True
 
     paths = measurement_paths(route_dir)
     if not paths:
-        return 0, 0, 0, False
+        return 0, 0, 0, False, False
 
     measurements = [load_json_gz(path) for path in paths]
     results = load_results(route_dir)
@@ -263,7 +265,7 @@ def label_route(
         safe_count += int(not unsafe)
 
     if not frames:
-        return 0, 0, 0, unresolved_collision
+        return 0, 0, 0, unresolved_collision, False
 
     dump_json_gz(output_path, {
         "label_map": {"safe": 0, "unsafe_sim_collision": 1},
@@ -279,7 +281,7 @@ def label_route(
         "pred_len": pred_len,
         "frames": frames,
     })
-    return len(frames), safe_count, unsafe_count, unresolved_collision
+    return len(frames), safe_count, unsafe_count, unresolved_collision, False
 
 
 def main() -> int:
@@ -297,7 +299,11 @@ def main() -> int:
         action="store_true",
         help="Only label junction, turn, lane-change, or changed-route frames.",
     )
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Regenerate plan_safety_labels.json.gz even if it already exists.",
+    )
     parser.add_argument(
         "--safe-samples-per-unsafe",
         type=float,
@@ -307,7 +313,7 @@ def main() -> int:
     parser.add_argument(
         "--max-safe-per-non-collision-route",
         type=int,
-        default=1,
+        default=0,
         help="For routes without collision, save at most this many safe labels.",
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -333,8 +339,9 @@ def main() -> int:
     safe_count = 0
     unsafe_count = 0
     unresolved_collision_count = 0
-    for route_dir in route_dirs:
-        frames, safe, unsafe, unresolved_collision = label_route(
+    skipped_existing_count = 0
+    for route_dir in tqdm(route_dirs, desc="Generating plan-safety labels", unit="route"):
+        frames, safe, unsafe, unresolved_collision, skipped_existing = label_route(
             route_dir,
             args.pred_len,
             args.all_frames or not args.focus_frames_only,
@@ -352,11 +359,13 @@ def main() -> int:
             safe_count += safe
             unsafe_count += unsafe
         unresolved_collision_count += int(unresolved_collision)
+        skipped_existing_count += int(skipped_existing)
 
     print(f"Labeled routes: {route_count}")
     print(f"Labeled frames: {frame_count}")
     print(f"safe=0: {safe_count}")
     print(f"unsafe_sim_collision=1: {unsafe_count}")
+    print(f"Skipped existing label files: {skipped_existing_count}")
     print(f"collision routes without usable collision frame: {unresolved_collision_count}")
     return 0
 
