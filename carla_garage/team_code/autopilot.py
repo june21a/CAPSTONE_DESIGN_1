@@ -27,6 +27,17 @@ from longitudinal_controller import LongitudinalLinearRegressionController
 from kinematic_bicycle_model import KinematicBicycleModel
 
 
+DEFAULT_EGO_EXTENT = np.array([2.45, 1.06], dtype=np.float32)
+DEFAULT_SIM_FPS = 20.0
+DEFAULT_MAX_ACCELERATION = 1.89
+DEFAULT_MAX_DECELERATION = 4.82
+DEFAULT_COLLISION_REGION_RADIUS = float(np.linalg.norm(DEFAULT_EGO_EXTENT))
+STRAIGHT_WAYPOINT_MAX_LATERAL_SPREAD = 0.5
+STRAIGHT_WAYPOINT_MAX_HEADING_CHANGE_DEG = 5.0
+COLLISION_POINT_SAME_LANE_LATERAL_MARGIN = float(DEFAULT_EGO_EXTENT[1]) + 0.5
+MAX_CHECKED_FRAMES_BEFORE_EVENT = 10
+
+
 def get_entry_point():
   return "AutoPilot"
 
@@ -1139,23 +1150,251 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
       return None
     return int(collision_data_frame)
 
+  def _load_saved_measurement(self, frame):
+    if self.save_path is None or frame is None:
+      return None
+    measurement_path = self.save_path / "measurements" / f"{int(frame):04}.json.gz"
+    if not measurement_path.is_file():
+      return None
+    try:
+      with gzip.open(measurement_path, "rt", encoding="utf-8") as f:
+        return ujson.load(f)
+    except (OSError, EOFError, ValueError):
+      return None
+
+  def _ego_extent_from_boxes(self, frame):
+    if self.save_path is None or frame is None:
+      return None
+    boxes_path = self.save_path / "boxes" / f"{int(frame):04}.json.gz"
+    if not boxes_path.is_file():
+      return None
+    try:
+      with gzip.open(boxes_path, "rt", encoding="utf-8") as f:
+        actors = ujson.load(f)
+    except (OSError, EOFError, ValueError):
+      return None
+
+    for actor in actors:
+      if actor.get("class") != "ego_car":
+        continue
+      extent = actor.get("extent")
+      if not isinstance(extent, list) or len(extent) < 2:
+        return None
+      try:
+        return np.array([float(extent[0]), float(extent[1])], dtype=np.float32)
+      except (TypeError, ValueError):
+        return None
+    return None
+
+  def _resolve_collision_region_radius(self, collision_data_frame):
+    ego_extent = self._ego_extent_from_boxes(collision_data_frame)
+    if ego_extent is not None:
+      return float(np.linalg.norm(ego_extent[:2].astype(np.float64))), "ego_extent_collision_frame_boxes", ego_extent.tolist()
+
+    for frame_key in sorted(self.plan_safety_label_frames):
+      ego_extent = self._ego_extent_from_boxes(int(frame_key))
+      if ego_extent is not None:
+        return float(np.linalg.norm(ego_extent[:2].astype(np.float64))), "ego_extent_dataset_boxes", ego_extent.tolist()
+
+    return DEFAULT_COLLISION_REGION_RADIUS, "default_ego_extent", DEFAULT_EGO_EXTENT.tolist()
+
+  def _speed_mps(self, measurement, key, default=0.0):
+    try:
+      return max(0.0, float(measurement.get(key, default) or default))
+    except (TypeError, ValueError):
+      return default
+
+  def _collision_point_in_ego(self, measurement, collision_measurement):
+    ego_matrix_raw = measurement.get("ego_matrix")
+    collision_matrix_raw = collision_measurement.get("ego_matrix")
+    if ego_matrix_raw is None or collision_matrix_raw is None:
+      return None
+
+    try:
+      ego_matrix = np.array(ego_matrix_raw, dtype=np.float64)
+      collision_matrix = np.array(collision_matrix_raw, dtype=np.float64)
+      relative_matrix = np.linalg.inv(ego_matrix) @ collision_matrix
+    except (TypeError, ValueError, np.linalg.LinAlgError):
+      return None
+
+    return relative_matrix[:2, 3].astype(np.float64)
+
+  def _path_points_from_waypoints(self, waypoints):
+    points = [np.zeros(2, dtype=np.float64)]
+    for waypoint in waypoints:
+      if not isinstance(waypoint, (list, tuple)) or len(waypoint) < 2:
+        continue
+      try:
+        points.append(np.array([float(waypoint[0]), float(waypoint[1])], dtype=np.float64))
+      except (TypeError, ValueError):
+        continue
+    return np.asarray(points, dtype=np.float64)
+
+  def _path_distance_to_region(self, points, center, radius):
+    if len(points) == 0:
+      return None
+
+    cumulative_distance = 0.0
+    best_distance_along_path = None
+    for index in range(len(points) - 1):
+      start = points[index]
+      end = points[index + 1]
+      segment = end - start
+      segment_length = float(np.linalg.norm(segment))
+      if segment_length < 1e-6:
+        distance_to_center = float(np.linalg.norm(center - start))
+        closest_distance_along_path = cumulative_distance
+      else:
+        projection = float(np.clip(np.dot(center - start, segment) / (segment_length**2), 0.0, 1.0))
+        closest = start + projection * segment
+        distance_to_center = float(np.linalg.norm(center - closest))
+        closest_distance_along_path = cumulative_distance + projection * segment_length
+
+      if distance_to_center <= radius:
+        if best_distance_along_path is None or closest_distance_along_path < best_distance_along_path:
+          best_distance_along_path = closest_distance_along_path
+      cumulative_distance += segment_length
+
+    if len(points) == 1 and float(np.linalg.norm(center - points[0])) <= radius:
+      return 0.0
+    return best_distance_along_path
+
+  def _straight_waypoint_rollout(self, waypoints):
+    points = self._path_points_from_waypoints(waypoints)
+    if len(points) < 3:
+      return False
+
+    path_points = points[1:]
+    lateral_spread = float(path_points[:, 1].max() - path_points[:, 1].min())
+    if lateral_spread > STRAIGHT_WAYPOINT_MAX_LATERAL_SPREAD:
+      return False
+
+    segment_vectors = np.diff(points, axis=0)
+    segment_lengths = np.linalg.norm(segment_vectors, axis=1)
+    valid_segments = segment_vectors[segment_lengths > 1e-3]
+    if len(valid_segments) < 2:
+      return True
+
+    headings = np.unwrap(np.arctan2(valid_segments[:, 1], valid_segments[:, 0]))
+    heading_change = math.degrees(float(headings.max() - headings.min()))
+    return heading_change <= STRAIGHT_WAYPOINT_MAX_HEADING_CHANGE_DEG
+
+  def _collision_point_same_lane_with_waypoints(self, waypoints, collision_point):
+    points = self._path_points_from_waypoints(waypoints)
+    if len(points) < 2:
+      return False
+
+    waypoint_lateral_offsets = points[1:, 1]
+    collision_lateral_offset = float(collision_point[1])
+    return bool(np.any(np.abs(waypoint_lateral_offsets - collision_lateral_offset) <=
+                       COLLISION_POINT_SAME_LANE_LATERAL_MARGIN))
+
+  def _velocity_rollout_distance(self, current_speed, target_speed, horizon_seconds, rollout_dt=0.05):
+    speed = max(0.0, float(current_speed))
+    target_speed = max(0.0, float(target_speed))
+    remaining_time = max(0.0, float(horizon_seconds))
+    distance = 0.0
+    dt = max(1e-3, float(rollout_dt))
+
+    while remaining_time > 1e-9:
+      step_dt = min(dt, remaining_time)
+      delta_speed = target_speed - speed
+      if abs(delta_speed) < 1e-9:
+        next_speed = speed
+      elif delta_speed > 0.0:
+        next_speed = min(target_speed, speed + DEFAULT_MAX_ACCELERATION * step_dt)
+      else:
+        next_speed = max(target_speed, speed - DEFAULT_MAX_DECELERATION * step_dt)
+      distance += 0.5 * (speed + next_speed) * step_dt
+      speed = next_speed
+      remaining_time -= step_dt
+
+    return distance
+
+  def _evaluate_collision_reachability(self, measurement, collision_measurement, frame, collision_data_frame,
+                                       collision_region_radius):
+    current_speed = self._speed_mps(measurement, "speed")
+    target_speed = self._speed_mps(measurement, "target_speed")
+    waypoints = measurement.get("route", [])[:self.config.pred_len]
+    straight_rollout = self._straight_waypoint_rollout(waypoints)
+    detail = {
+        "current_speed": round(current_speed, 4),
+        "target_speed": round(target_speed, 4),
+        "straight_waypoint_rollout": straight_rollout,
+        "collision_point_same_lane_with_straight_waypoints": False,
+        "collision_case_excluded_straight": False,
+        "collision_case_outside_checked_window": False,
+        "collision_case_unsafe": False,
+        "collision_distance": None,
+        "time_to_collision": None,
+        "intersects_future_collision_region": False,
+        "reachable_before_collision": False,
+        "distance_to_collision_region_along_rollout": None,
+        "reachable_distance_before_collision": None,
+    }
+
+    if collision_data_frame is None or collision_measurement is None or frame >= collision_data_frame:
+      return False, detail
+
+    if collision_data_frame - frame > MAX_CHECKED_FRAMES_BEFORE_EVENT:
+      detail["collision_case_outside_checked_window"] = True
+      return False, detail
+
+    collision_point = self._collision_point_in_ego(measurement, collision_measurement)
+    if collision_point is None:
+      return False, detail
+
+    same_lane_collision_point = self._collision_point_same_lane_with_waypoints(waypoints, collision_point)
+    detail["collision_point_same_lane_with_straight_waypoints"] = same_lane_collision_point
+    if straight_rollout and not same_lane_collision_point:
+      detail["collision_case_excluded_straight"] = True
+      return False, detail
+
+    collision_distance = float(np.linalg.norm(collision_point))
+    time_to_collision = ((collision_data_frame - frame) * max(1, int(self.config.data_save_freq)) /
+                         max(DEFAULT_SIM_FPS, 1e-6))
+    detail["collision_distance"] = round(collision_distance, 4)
+    detail["time_to_collision"] = round(time_to_collision, 4)
+
+    points = self._path_points_from_waypoints(waypoints)
+    distance_to_region = self._path_distance_to_region(points, collision_point, max(0.0, collision_region_radius))
+    if distance_to_region is None:
+      return False, detail
+
+    reachable_distance = self._velocity_rollout_distance(current_speed, target_speed, time_to_collision)
+    detail["intersects_future_collision_region"] = True
+    detail["distance_to_collision_region_along_rollout"] = round(distance_to_region, 4)
+    detail["reachable_distance_before_collision"] = round(reachable_distance, 4)
+    detail["reachable_before_collision"] = reachable_distance >= distance_to_region
+    detail["collision_case_unsafe"] = bool(detail["reachable_before_collision"])
+    return bool(detail["reachable_before_collision"]), detail
+
   def _write_plan_safety_labels(self, results=None):
     if self.save_path is None or not self.datagen or not self.plan_safety_label_frames:
       return
 
     route_had_collision = self._results_have_collision(results)
     collision_data_frame = self._collision_data_frame_from_results(results)
-    unsafe_window_frames = 10
-    unsafe_start_frame = None if collision_data_frame is None else max(0, collision_data_frame - unsafe_window_frames)
+    collision_measurement = self._load_saved_measurement(collision_data_frame)
+    collision_region_radius, collision_region_radius_source, ego_extent = self._resolve_collision_region_radius(
+        collision_data_frame)
 
     labeled_frames = {}
     for frame_key, candidates in self.plan_safety_label_frames.items():
       frame = int(frame_key)
       if collision_data_frame is not None and frame >= collision_data_frame:
         continue
+      measurement = self._load_saved_measurement(frame)
       for candidate in candidates:
-        unsafe = unsafe_start_frame is not None and unsafe_start_frame <= frame < collision_data_frame
+        safety_detail = None
+        if measurement is not None:
+          unsafe, safety_detail = self._evaluate_collision_reachability(
+              measurement, collision_measurement, frame, collision_data_frame, collision_region_radius)
+        else:
+          unsafe = False
         candidate["will_collide"] = self.plan_safety_unsafe_label if unsafe else self.plan_safety_safe_label
+        if safety_detail is not None:
+          candidate["safety_label_detail"] = safety_detail
       labeled_frames[frame_key] = candidates
 
     labels = {
@@ -1167,7 +1406,21 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         "case_label": self.plan_safety_case_label,
         "route_had_collision": route_had_collision,
         "collision_data_frame": collision_data_frame,
-        "unsafe_window_frames": unsafe_window_frames,
+        "collision_case_unsafe_criterion": (
+            "within_10_frames_before_collision_future_collision_region_intersection_and_velocity_rollout_reachability_"
+            "excluding_straight_waypoints_unless_collision_point_is_in_same_lane"),
+        "max_checked_frames_before_event": MAX_CHECKED_FRAMES_BEFORE_EVENT,
+        "straight_waypoint_max_lateral_spread": STRAIGHT_WAYPOINT_MAX_LATERAL_SPREAD,
+        "straight_waypoint_max_heading_change_deg": STRAIGHT_WAYPOINT_MAX_HEADING_CHANGE_DEG,
+        "collision_point_same_lane_lateral_margin": COLLISION_POINT_SAME_LANE_LATERAL_MARGIN,
+        "sim_fps": DEFAULT_SIM_FPS,
+        "data_save_freq": self.config.data_save_freq,
+        "max_acceleration": DEFAULT_MAX_ACCELERATION,
+        "max_deceleration": DEFAULT_MAX_DECELERATION,
+        "rollout_dt": 0.05,
+        "collision_region_radius": collision_region_radius,
+        "collision_region_radius_source": collision_region_radius_source,
+        "ego_extent": ego_extent,
         "pred_len": self.config.pred_len,
         "frames": labeled_frames,
     }
