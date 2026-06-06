@@ -25,5 +25,6 @@ torchrun --nnodes=1 --nproc_per_node=1 --max_restarts=0 --rdzv_id=$SLURM_JOB_ID 
     train.py --id ablation_baseline --use_disk_cache 0 --crop_image 1 --seed 0 --epochs 10 --batch_size 16 --lr 3e-4 --setting all \
     --root_dir /home/ec2-user/AD_challenge/CAPSTONE_DESIGN_1/carla_garage/training_data \
     --logdir /home/ec2-user/AD_challenge/experiments \
-    --use_controller_input_prediction 0 --continue_epoch 0 --cpu_cores 32 --num_repetitions 1 --use_cosine_schedule 1 --cosine_t0 1 \
-    --image_architecture regnety_032 --lidar_architecture regnety_032
+    --use_controller_input_prediction 1 --continue_epoch 0 --cpu_cores 32 --num_repetitions 1 --use_cosine_schedule 1 --cosine_t0 1 \
+    --image_architecture regnety_032 --lidar_architecture regnety_032 \
+    --load_file /home/ec2-user/AD_challenge/experiments/ablation_baseline/model_0009.pth
