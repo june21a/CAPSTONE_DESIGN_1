@@ -756,7 +756,8 @@ class LidarCenterNet(nn.Module):
       gt_bbs=None,
       gt_speed=None,
       gt_bev_semantic=None,
-      wp_selected=None):
+      wp_selected=None,
+      collision_prediction=None):
     # 0 Car, 1 Pedestrian, 2 Red light, 3 Stop sign, 4 emergency vehicle
     color_classes = [
         np.array([255, 165, 0]),
@@ -923,6 +924,7 @@ class LidarCenterNet(nn.Module):
     images_lidar = np.rot90(images_lidar, k=1)
     images_lidar = np.ascontiguousarray(images_lidar, dtype=np.uint8)
     rgb_image = rgb[0].permute(1, 2, 0).detach().cpu().numpy()
+    rgb_image = np.ascontiguousarray(np.clip(rgb_image, 0, 255).astype(np.uint8))
 
     if wp_selected is not None:
       colors_name = ['blue', 'yellow']
@@ -943,6 +945,24 @@ class LidarCenterNet(nn.Module):
     if pred_target_speed_scalar is not None:
       cv2.putText(images_lidar, f'Pred TS: {pred_target_speed_scalar:.2f}', (10, 660), cv2.FONT_HERSHEY_SIMPLEX, 1,
                   (0, 0, 0), 1, cv2.LINE_AA)
+
+    if collision_prediction is not None:
+      status = collision_prediction.get('status', 'SAFE')
+      time_to_collision = collision_prediction.get('time_to_collision_s')
+      status_colors = {
+          'SAFE': (0, 150, 0),
+          'CAUTION': (220, 170, 0),
+          'COLLISION RISK': (230, 90, 0),
+          'IMMINENT': (210, 0, 0),
+      }
+      banner_color = status_colors.get(status, (80, 80, 80))
+      cv2.rectangle(rgb_image, (0, 0), (rgb_image.shape[1], 58), banner_color, thickness=-1)
+      if time_to_collision is None:
+        warning_text = f'{status} | No collision within {collision_prediction.get("prediction_horizon_s", 3.0):.1f}s'
+      else:
+        warning_text = f'{status} | TTC: {time_to_collision:.1f}s'
+      cv2.putText(rgb_image, warning_text, (18, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2,
+                  cv2.LINE_AA)
 
     all_images = np.concatenate((rgb_image, images_lidar), axis=0)
     all_images = Image.fromarray(all_images.astype(np.uint8))

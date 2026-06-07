@@ -18,6 +18,7 @@ import math
 
 from leaderboard.autoagents import autonomous_agent
 from model import LidarCenterNet
+from collision_predictor import RealTimeCollisionPredictor
 from config import GlobalConfig
 from data import CARLA_Data
 from nav_planner import RoutePlanner
@@ -121,6 +122,21 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     # If set to true, will generate visualizations at SAVE_PATH
     self.config.debug = int(os.environ.get('DEBUG_CHALLENGE', 0)) == 1
+
+    self.collision_prediction_enabled = strtobool(os.environ.get('COLLISION_PREDICTION', '1'))
+    collision_prediction_horizon = float(os.environ.get('COLLISION_PREDICTION_HORIZON', 3.0))
+    collision_prediction_step = float(os.environ.get('COLLISION_PREDICTION_STEP', 0.1))
+    collision_update_interval = float(os.environ.get('COLLISION_UPDATE_INTERVAL', 0.1))
+    self.collision_predictor = RealTimeCollisionPredictor(
+        fps=self.config.carla_fps,
+        update_interval=collision_update_interval,
+        prediction_horizon=collision_prediction_horizon,
+        prediction_step=collision_prediction_step,
+        ego_extent=(self.config.ego_extent_x, self.config.ego_extent_y))
+    self.collision_prediction_result = self.collision_predictor.latest_result
+    print('Collision prediction:', self.collision_prediction_enabled,
+          f'horizon={collision_prediction_horizon:.1f}s',
+          f'update={collision_update_interval:.1f}s')
 
     self.compile = int(os.environ.get('COMPILE', 0)) == 1
 
@@ -946,8 +962,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         if latest_lidar_attention_map is not None:
           lidar_attention_maps.append(latest_lidar_attention_map)
         # Only convert bounding boxes when they are used.
-        if self.config.detect_boxes and (compute_debug_output or self.config.backbone in ('aim') or
-                                         self.stop_sign_controller):
+        if self.config.detect_boxes and (compute_debug_output or self.collision_prediction_enabled or
+                                         self.config.backbone in ('aim') or self.stop_sign_controller):
           pred_bounding_box = self.nets[i].convert_features_to_bb_metric(pred_bb_features)
         else:
           pred_bounding_box = None
@@ -971,14 +987,21 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       bounding_boxes.append(pred_bounding_box)
 
     # Average the predictions from ensembles
-    if self.config.detect_boxes and (compute_debug_output or self.config.backbone in ('aim') or
-                                     self.stop_sign_controller):
+    if self.config.detect_boxes and (compute_debug_output or self.collision_prediction_enabled or
+                                     self.config.backbone in ('aim') or self.stop_sign_controller):
       # We average bounding boxes by using non-maximum suppression on the set of all detected boxes.
       bbs_vehicle_coordinate_system = t_u.non_maximum_suppression(bounding_boxes, self.config.iou_treshold_nms)
 
       self.bb_buffer.append(bbs_vehicle_coordinate_system)
     else:
       bbs_vehicle_coordinate_system = None
+
+    if self.collision_prediction_enabled and self.collision_predictor.should_update(self.step):
+      self.collision_prediction_result = self.collision_predictor.update(
+          step=self.step,
+          ego_speed=gt_velocity.item(),
+          ego_pose=(ego_x, ego_y, ego_theta),
+          bounding_boxes=bbs_vehicle_coordinate_system)
 
     if self.stop_sign_controller:
       stop_for_stop_sign = self.stop_sign_controller_step(gt_velocity.item())
@@ -1042,7 +1065,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
           pred_bb=bbs_vehicle_coordinate_system,
           gt_speed=gt_velocity,
           gt_wp=pred_wp_1,
-          wp_selected=wp_selected)
+          wp_selected=wp_selected,
+          collision_prediction=self.collision_prediction_result)
 
     if self.config.inference_direct_controller and self.config.use_controller_input_prediction:
       pred_checkpoints = torch.stack(pred_checkpoints, dim=0).mean(dim=0).detach().cpu().numpy()

@@ -16,12 +16,16 @@ CARLA_GARAGE_DIR="${CURRENT_DIR}/carla_garage"
 AGENT_CONFIG="./pretrained_models/all_towns"
 AGENT="./team_code/comparison_agent.py"
 ROUTES="./leaderboard/data/bench2drive220_test_sample_55.xml"
-SAVE_PATH_DIR="./results/baseline_b2d55"
+SAVE_PATH_DIR="./results/code_fix_b2d55"
 CHECKPOINT="${SAVE_PATH_DIR}/debug_results.json"
 RESUME=1
 
 # ===== Environment Variables =====
 export DEBUG_CHALLENGE=1
+export COLLISION_PREDICTION=1
+export COLLISION_PREDICTION_HORIZON=3.0
+export COLLISION_PREDICTION_STEP=0.1
+export COLLISION_UPDATE_INTERVAL=0.1
 export SAVE_PATH="${SAVE_PATH_DIR}"
 export COLLECT_SENSOR_DATA=1
 export ATTENTION_VIS=1
