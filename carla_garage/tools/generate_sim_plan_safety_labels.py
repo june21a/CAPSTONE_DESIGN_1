@@ -41,6 +41,7 @@ DEFAULT_COLLISION_REGION_RADIUS = float(np.linalg.norm(DEFAULT_EGO_EXTENT))
 STRAIGHT_WAYPOINT_MAX_LATERAL_SPREAD = 0.5
 STRAIGHT_WAYPOINT_MAX_HEADING_CHANGE_DEG = 5.0
 MAX_CHECKED_FRAMES_BEFORE_EVENT = 10
+DEFAULT_COLLISION_FRAME_FUTURE_WINDOW = 5
 DEFAULT_NONZERO_STEER_THRESHOLD = 1e-3
 COLLISION_REGION_EGO_BOX_SAMPLE_SPACING = 0.5
 
@@ -415,6 +416,13 @@ def path_points_from_waypoints(waypoints: list[Any]) -> np.ndarray:
     return np.asarray(points, dtype=np.float64)
 
 
+def plan_waypoints_from_measurement(measurement: dict[str, Any], pred_len: int) -> tuple[list[Any], str]:
+    pred_waypoints = measurement.get("pred_waypoints")
+    if isinstance(pred_waypoints, list) and pred_waypoints:
+        return pred_waypoints[:pred_len], "pred_waypoints"
+    return measurement.get("route", [])[:pred_len], "route"
+
+
 def normalize_ego_extent(ego_extent: list[float] | np.ndarray | None) -> np.ndarray:
     if ego_extent is None:
         return DEFAULT_EGO_EXTENT.astype(np.float64)
@@ -569,11 +577,12 @@ def evaluate_collision_reachability(
 ) -> tuple[bool, dict[str, Any]]:
     current_speed = speed_mps(measurement, "speed")
     target_speed = speed_mps(measurement, "target_speed")
-    waypoints = measurement.get("route", [])[:pred_len]
+    waypoints, plan_waypoint_source = plan_waypoints_from_measurement(measurement, pred_len)
     straight_rollout = straight_waypoint_rollout(waypoints)
     detail: dict[str, Any] = {
         "current_speed": round(current_speed, 4),
         "target_speed": round(target_speed, 4),
+        "plan_waypoint_source": plan_waypoint_source,
         "straight_waypoint_rollout": straight_rollout,
         "collision_region_overlap_test": "ego_box_circle",
         "ego_extent": normalize_ego_extent(ego_extent).round(4).tolist(),
@@ -614,7 +623,6 @@ def evaluate_collision_reachability(
     if distance_to_region is None:
         return False, detail
     
-    print(frame)
     reachable_distance = velocity_rollout_distance(
         current_speed,
         target_speed,
@@ -646,10 +654,12 @@ def evaluate_collision_events_reachability(
     collision_region_radii: dict[int, float],
     default_ego_extent: list[float] | np.ndarray | None,
     ego_extents: dict[int, list[float]],
+    collision_frame_future_window: int,
 ) -> tuple[bool, dict[str, Any]]:
     checked_count = 0
     best_safe_detail = None
     best_future_frame = None
+    collision_frame_future_window = max(0, int(collision_frame_future_window))
     resolved_event_count = sum(1 for event in collision_events if event.get("frame") is not None)
 
     for event_index, event in enumerate(collision_events):
@@ -657,40 +667,55 @@ def evaluate_collision_events_reachability(
         if collision_frame is None:
             continue
         collision_frame = int(collision_frame)
-        if frame >= collision_frame:
-            continue
-        
-        checked_count += 1
-        collision_measurement = frame_to_measurement.get(collision_frame)
-        collision_region_radius = collision_region_radii.get(collision_frame, default_collision_region_radius)
-        ego_extent = ego_extents.get(collision_frame, default_ego_extent)
-        unsafe, detail = evaluate_collision_reachability(
-            measurement,
-            collision_measurement,
-            frame,
-            collision_frame,
-            pred_len,
-            data_save_freq,
-            sim_fps,
-            max_acceleration,
-            max_deceleration,
-            rollout_dt,
-            collision_region_radius,
-            ego_extent,
-        )
-        detail["collision_event_index"] = event_index
-        detail["collision_event_count"] = resolved_event_count
-        detail["checked_future_collision_event_count"] = checked_count
-        detail["collision_event_source"] = event.get("source")
-        detail["collision_event_location_distance"] = event.get("location_distance")
-        detail["collision_event_location_index"] = event.get("location_index")
+        for future_offset in range(collision_frame_future_window + 1):
+            collision_measurement_frame = collision_frame + future_offset
+            if frame >= collision_measurement_frame:
+                continue
 
-        if unsafe:
-            return True, detail
+            collision_measurement = frame_to_measurement.get(collision_measurement_frame)
+            if collision_measurement is None:
+                continue
 
-        if best_safe_detail is None or collision_frame < best_future_frame:
-            best_safe_detail = detail
-            best_future_frame = collision_frame
+            checked_count += 1
+            collision_region_radius = collision_region_radii.get(
+                collision_measurement_frame,
+                collision_region_radii.get(collision_frame, default_collision_region_radius),
+            )
+            ego_extent = ego_extents.get(
+                collision_measurement_frame,
+                ego_extents.get(collision_frame, default_ego_extent),
+            )
+            unsafe, detail = evaluate_collision_reachability(
+                measurement,
+                collision_measurement,
+                frame,
+                collision_measurement_frame,
+                pred_len,
+                data_save_freq,
+                sim_fps,
+                max_acceleration,
+                max_deceleration,
+                rollout_dt,
+                collision_region_radius,
+                ego_extent,
+            )
+            detail["collision_event_index"] = event_index
+            detail["collision_event_count"] = resolved_event_count
+            detail["checked_future_collision_event_count"] = checked_count
+            detail["collision_event_source"] = event.get("source")
+            detail["collision_event_location_distance"] = event.get("location_distance")
+            detail["collision_event_location_index"] = event.get("location_index")
+            detail["collision_event_frame"] = collision_frame
+            detail["collision_measurement_frame"] = collision_measurement_frame
+            detail["collision_frame_future_offset"] = future_offset
+            detail["collision_frame_future_window"] = collision_frame_future_window
+
+            if unsafe:
+                return True, detail
+
+            if best_safe_detail is None or collision_measurement_frame < best_future_frame:
+                best_safe_detail = detail
+                best_future_frame = collision_measurement_frame
 
     if best_safe_detail is not None:
         best_safe_detail["checked_future_collision_event_count"] = checked_count
@@ -716,6 +741,10 @@ def evaluate_collision_events_reachability(
     detail["collision_event_source"] = None
     detail["collision_event_location_distance"] = None
     detail["collision_event_location_index"] = None
+    detail["collision_event_frame"] = None
+    detail["collision_measurement_frame"] = None
+    detail["collision_frame_future_offset"] = None
+    detail["collision_frame_future_window"] = collision_frame_future_window
     return False, detail
 
 
@@ -725,10 +754,11 @@ def candidate_from_measurement(
     unsafe: bool,
     safety_detail: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    waypoints = measurement.get("route", [])[:pred_len]
+    waypoints, plan_waypoint_source = plan_waypoints_from_measurement(measurement, pred_len)
     target_speed = measurement.get("target_speed", 0.0)
     candidate = {
         "variant": "expert",
+        "plan_waypoint_source": plan_waypoint_source,
         "waypoints": waypoints,
         "target_speed": round(float(target_speed), 4),
         "expert_target_speed": round(float(measurement.get("expert_target_speed", target_speed)), 4),
@@ -964,6 +994,7 @@ def render_dataset_trajectory_visualization(
     include_rgb: bool,
     unsafe_label: int,
 ) -> Path | None:
+    _ = horizon
     measurement_path = route_dir / "measurements" / f"{int(frame_key):04}.json.gz"
     if not measurement_path.is_file():
         return None
@@ -974,13 +1005,15 @@ def render_dataset_trajectory_visualization(
         raise ImportError("Trajectory visualization requires Pillow. Install it with `pip install pillow`.") from exc
 
     measurement = load_json_gz(measurement_path)
-    origin_matrix_raw = measurement.get("ego_matrix")
-    if origin_matrix_raw is None:
+    if not candidates:
         return None
-
-    origin_matrix = np.array(origin_matrix_raw, dtype=np.float64)
-    tracks = load_actor_tracks_from_dataset(route_dir, int(frame_key), horizon, origin_matrix)
-    if not tracks:
+    display_candidate = dict(candidates[0])
+    pred_waypoints = measurement.get("pred_waypoints")
+    if pred_waypoints:
+        waypoint_count = len(display_candidate.get("waypoints") or pred_waypoints)
+        display_candidate["waypoints"] = pred_waypoints[:waypoint_count]
+        display_candidate["plan_waypoint_source"] = "pred_waypoints"
+    elif display_candidate.get("plan_waypoint_source") != "pred_waypoints":
         return None
 
     width = max(1, int(round((max_y - min_y) * pixels_per_meter)))
@@ -993,45 +1026,20 @@ def render_dataset_trajectory_visualization(
     draw.line(((0, zero_x), (width, zero_x)), fill=(220, 220, 220), width=1)
     draw.line(((zero_y, 0), (zero_y, height)), fill=(220, 220, 220), width=1)
 
-    for track in tracks.values():
-        poses = track["poses"]
-        actor_class = track["class"]
-        color = TRAJECTORY_CLASS_COLORS.get(actor_class, DEFAULT_TRAJECTORY_COLOR)
-        points = [image_point(pose[0], pose[1], pixels_per_meter, min_y, max_x) for pose in poses]
-        if len(points) > 1:
-            draw.line(points, fill=color, width=4 if actor_class == "ego_car" else 2)
-        for point_index, point in enumerate(points):
-            radius = 4 if actor_class == "ego_car" else 3
-            fill = color if point_index == len(points) - 1 else tuple(max(0, int(channel * 0.65)) for channel in color)
-            draw.ellipse((point[0] - radius, point[1] - radius, point[0] + radius, point[1] + radius), fill=fill)
-        if poses:
-            draw_oriented_box(
-                draw,
-                poses[-1],
-                track.get("extent", DEFAULT_EGO_EXTENT.tolist()),
-                color,
-                pixels_per_meter,
-                min_y,
-                max_x,
-                width=3 if actor_class == "ego_car" else 2,
-            )
-
-    if candidates:
-        draw_candidate_waypoints(draw, candidates[0], pixels_per_meter, min_y, max_x)
+    draw_candidate_waypoints(draw, display_candidate, pixels_per_meter, min_y, max_x)
 
     label = "unsafe" if any(unsafe_candidate(candidate, unsafe_label) for candidate in candidates) else "safe"
     title_color = (210, 30, 30) if label == "unsafe" else (20, 135, 55)
-    draw.text((8, 8), f"{frame_key} {label} recorded dataset trajectories", fill=title_color)
-    draw.text((8, 24), f"horizon={horizon} saved frames, actors={len(tracks)}", fill=(35, 35, 35))
-    if candidates:
-        target_speed_text, waypoint_text = candidate_status_text(candidates[0])
-        draw.text((8, 40), target_speed_text, fill=(20, 20, 20))
-        draw.text((8, 56), waypoint_text, fill=(20, 20, 20))
+    draw.text((8, 8), f"{frame_key} {label} pred_waypoints", fill=title_color)
+    draw.text((8, 24), "source=pred_waypoints", fill=(35, 35, 35))
+    target_speed_text, waypoint_text = candidate_status_text(display_candidate)
+    draw.text((8, 40), target_speed_text, fill=(20, 20, 20))
+    draw.text((8, 56), waypoint_text, fill=(20, 20, 20))
     if include_rgb:
         image = append_rgb_panel(image, route_dir, frame_key)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{frame_key}_{label}_dataset_trajectories.png"
+    output_path = output_dir / f"{frame_key}_{label}_pred_waypoints.png"
     image.save(output_path)
     return output_path
 
@@ -1105,6 +1113,7 @@ def label_route(
     max_deceleration: float,
     rollout_dt: float,
     collision_region_radius: float | None,
+    collision_frame_future_window: int,
     safe_samples_per_unsafe: float,
     max_safe_per_non_collision_route: int,
     safe_consecutive_nonzero_steer_frames: int,
@@ -1162,6 +1171,7 @@ def label_route(
         data_save_freq,
     )
     resolved_collision_events = [event for event in collision_events if event.get("frame") is not None]
+    collision_frame_future_window = max(0, int(collision_frame_future_window))
     primary_collision_event = resolved_collision_events[0] if resolved_collision_events else {}
     collision_frame = primary_collision_event.get("frame")
     collision_frame_source = primary_collision_event.get("source")
@@ -1181,15 +1191,17 @@ def label_route(
     ego_extents_by_frame = {}
     for event in resolved_collision_events:
         event_frame = int(event["frame"])
-        event_radius, event_radius_source, event_ego_extent = resolve_collision_region_radius(
-            route_dir,
-            paths,
-            event_frame,
-            collision_region_radius,
-        )
-        collision_region_radii[event_frame] = event_radius
-        collision_region_radius_sources[event_frame] = event_radius_source
-        ego_extents_by_frame[event_frame] = event_ego_extent
+        for future_offset in range(collision_frame_future_window + 1):
+            collision_measurement_frame = event_frame + future_offset
+            event_radius, event_radius_source, event_ego_extent = resolve_collision_region_radius(
+                route_dir,
+                paths,
+                collision_measurement_frame,
+                collision_region_radius,
+            )
+            collision_region_radii[collision_measurement_frame] = event_radius
+            collision_region_radius_sources[collision_measurement_frame] = event_radius_source
+            ego_extents_by_frame[collision_measurement_frame] = event_ego_extent
     case_label = "collision" if collision else "success"
     safe_consecutive_nonzero_steer_frames = max(0, int(safe_consecutive_nonzero_steer_frames))
     nonzero_steer_threshold = max(0.0, float(nonzero_steer_threshold))
@@ -1205,7 +1217,7 @@ def label_route(
     for path, measurement in zip(paths, measurements):
         frame_key = path.stem.split(".")[0]
         frame = int(frame_key)
-        if last_collision_frame is not None and frame >= last_collision_frame:
+        if last_collision_frame is not None and frame > last_collision_frame + collision_frame_future_window:
             continue
         if not focus_frame(measurement, all_frames):
             continue
@@ -1224,6 +1236,7 @@ def label_route(
             collision_region_radii,
             ego_extent,
             ego_extents_by_frame,
+            collision_frame_future_window,
         )
         unsafe = collision_unsafe
         safety_detail = collision_detail
@@ -1299,9 +1312,11 @@ def label_route(
         "collision_events": collision_events,
         "collision_event_count": len(resolved_collision_events),
         "collision_case_unsafe_criterion": (
-            "within_10_frames_before_each_collision_event_future_collision_region_ego_box_overlap_and_velocity_rollout_reachability"
+            "within_10_frames_before_each_collision_event_and_up_to_future_collision_frame_window_"
+            "future_collision_region_ego_box_overlap_and_velocity_rollout_reachability"
         ),
         "max_checked_frames_before_event": MAX_CHECKED_FRAMES_BEFORE_EVENT,
+        "collision_frame_future_window": collision_frame_future_window,
         "straight_waypoint_max_lateral_spread": STRAIGHT_WAYPOINT_MAX_LATERAL_SPREAD,
         "straight_waypoint_max_heading_change_deg": STRAIGHT_WAYPOINT_MAX_HEADING_CHANGE_DEG,
         "sim_fps": sim_fps,
@@ -1348,8 +1363,8 @@ def label_route(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate simulator-derived plan safety labels.")
     parser.add_argument("--data-root", type=Path, required=True)
-    parser.add_argument("--pred-len", type=int, default=8)
-    parser.add_argument("--data-save-freq", type=int, default=10)
+    parser.add_argument("--pred-len", type=int, default=10)
+    parser.add_argument("--data-save-freq", type=int, default=5)
     parser.add_argument(
         "--sim-fps",
         type=float,
@@ -1377,10 +1392,19 @@ def main() -> int:
     parser.add_argument(
         "--collision-region-radius",
         type=float,
-        default=2.0,
+        default=0.5,
         help=(
             "Optional radius in meters around the future collision pose treated as the collision region. "
             "Defaults to the ego_car extent from dataset boxes, falling back to the built-in ego extent."
+        ),
+    )
+    parser.add_argument(
+        "--collision-frame-future-window",
+        type=int,
+        default=DEFAULT_COLLISION_FRAME_FUTURE_WINDOW,
+        help=(
+            "Number of saved measurement frames after each collision frame to also test as collision-region poses. "
+            "This tolerates small collision-frame/measurement-frame alignment errors."
         ),
     )
     parser.add_argument(
@@ -1440,18 +1464,18 @@ def main() -> int:
     parser.add_argument(
         "--visualize-trajectories",
         action="store_true",
-        help="Render recorded dataset trajectories for labeled frames while generating labels.",
+        help="Render predicted plan waypoints for labeled frames while generating labels.",
     )
     parser.add_argument(
         "--trajectory-visualization-output-dir",
         type=str,
-        help="Where to write trajectory PNGs. Defaults to DATA_ROOT/sim_plan_safety_trajectory_visualizations.",
+        help="Where to write predicted waypoint PNGs. Defaults to DATA_ROOT/sim_plan_safety_trajectory_visualizations.",
     )
     parser.add_argument(
         "--trajectory-visualization-horizon",
         type=int,
         default=10,
-        help="Number of future saved dataset frames to draw. Uses recorded boxes, not prediction.",
+        help="Unused for predicted waypoint visualization; kept for command compatibility.",
     )
     parser.add_argument(
         "--trajectory-visualization-max-frames-per-route",
@@ -1466,7 +1490,7 @@ def main() -> int:
     parser.add_argument(
         "--trajectory-visualization-include-rgb",
         action="store_true",
-        help="Write trajectory PNGs as RGB camera frame plus recorded BEV trajectory side-by-side.",
+        help="Write predicted waypoint PNGs as RGB camera frame plus BEV waypoints side-by-side.",
     )
     parser.add_argument("--trajectory-visualization-pixels-per-meter", type=float, default=5.0)
     parser.add_argument("--trajectory-visualization-min-x", type=float, default=-32.0)
@@ -1511,6 +1535,7 @@ def main() -> int:
             args.max_deceleration,
             args.rollout_dt,
             args.collision_region_radius,
+            args.collision_frame_future_window,
             args.safe_samples_per_unsafe,
             args.max_safe_per_non_collision_route,
             args.safe_consecutive_nonzero_steer_frames,
@@ -1545,7 +1570,7 @@ def main() -> int:
     print(f"Skipped existing label files: {skipped_existing_count}")
     print(f"collision routes without usable collision frame: {unresolved_collision_count}")
     if args.visualize_trajectories:
-        print(f"Recorded dataset trajectory visualizations: {rendered_visualization_count}")
+        print(f"Predicted waypoint visualizations: {rendered_visualization_count}")
         print(f"Trajectory visualization output: {trajectory_visualization_output_dir}")
     return 0
 

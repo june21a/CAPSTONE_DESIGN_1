@@ -619,7 +619,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     for path in self.vision_task_paths.values():
       path.mkdir(parents=True, exist_ok=True)
 
-  def _on_plan_safety_candidate(self, tick_data, waypoints, target_speed, control):
+  def _on_plan_safety_candidate(self, tick_data, waypoints, target_speed, control, pred_waypoints=None):
     pass
 
   def _init(self):
@@ -1029,7 +1029,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
           current_game_time = float(timestamp) if timestamp is not None else self.step * self.config.carla_frame_rate
           can_activate_stop_mode = current_game_time >= self.stop_mode_cooldown_until
           if stop_mode_active and can_activate_stop_mode:
-            self.stop_mode_zero_until = current_game_time + 2.0 # 40frame
+            self.stop_mode_zero_until = current_game_time + 0.5  # 10frame
             self.stop_mode_cooldown_until = self.stop_mode_zero_until + 3.0 # 60frame
 
           if self.stop_mode_zero_until is not None and current_game_time < self.stop_mode_zero_until:
@@ -1150,7 +1150,12 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       brake = True
 
     control = carla.VehicleControl(steer=float(steer), throttle=float(throttle), brake=float(brake))
-    self._on_plan_safety_candidate(tick_data, plan_safety_waypoints, pred_target_speed_scalar, control)
+    self._on_plan_safety_candidate(
+        tick_data,
+        plan_safety_waypoints,
+        pred_target_speed_scalar,
+        control,
+        pred_waypoints=plan_safety_waypoints)
     self._save_sensor_attention_data(tick_data, lidar_bev, rgb_attention_map, lidar_attention_map, control,
                                      pred_target_speed_scalar)
     self._save_vision_task_data(tick_data, lidar_bev, pred_semantic, pred_bev_semantic, pred_depth,

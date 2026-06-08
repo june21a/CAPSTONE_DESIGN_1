@@ -209,7 +209,7 @@ class TransfuserDataAgent(SensorAgent):
     }]
     return sensors
 
-  def _on_plan_safety_candidate(self, tick_data, waypoints, target_speed, control):
+  def _on_plan_safety_candidate(self, tick_data, waypoints, target_speed, control, pred_waypoints=None):
     if self.save_path is None or not self.datagen:
       return
     if self.step % self.config.data_save_freq != 0:
@@ -217,6 +217,7 @@ class TransfuserDataAgent(SensorAgent):
 
     frame = self.step // self.config.data_save_freq
     plan_safety_route = self._waypoints_to_list(waypoints)
+    pred_waypoints_list = self._waypoints_to_list(pred_waypoints)
     route, route_original, next_command = self._route_measurement_from_planner(tick_data, plan_safety_route)
     target_point = self._tensor_to_list(tick_data.get('target_point'), default=[0.0, 0.0])
     target_point_next = self._tensor_to_list(tick_data.get('target_point_next'), default=target_point)
@@ -238,6 +239,7 @@ class TransfuserDataAgent(SensorAgent):
         'source': 'carla_transfuser',
         'route': route,
         'route_original': route_original,
+        'pred_waypoints': pred_waypoints_list,
         'changed_route': False,
         'pos_global': ego_location,
         'theta': float(theta),
@@ -547,11 +549,19 @@ class TransfuserDataAgent(SensorAgent):
       waypoints = waypoints[0]
     return [[float(point[0]), float(point[1])] for point in waypoints if len(point) >= 2]
 
+  def _plan_waypoints_from_measurement(self, measurement):
+    pred_waypoints = measurement.get('pred_waypoints')
+    if isinstance(pred_waypoints, list) and pred_waypoints:
+      return pred_waypoints[:self.config.pred_len], 'pred_waypoints'
+    return measurement.get('route', [])[:self.config.pred_len], 'route'
+
   def _add_plan_safety_label_candidate(self, frame, measurement):
     self.plan_safety_case_label = measurement.get('sim_case_label', self.plan_safety_case_label)
+    waypoints, plan_waypoint_source = self._plan_waypoints_from_measurement(measurement)
     self.plan_safety_label_frames[f'{frame:04}'] = [{
         'variant': measurement.get('sim_case_label', 'transfuser'),
-        'waypoints': measurement.get('route', [])[:self.config.pred_len],
+        'plan_waypoint_source': plan_waypoint_source,
+        'waypoints': waypoints,
         'target_speed': round(float(measurement.get('target_speed', 0.0)), 4),
         'expert_target_speed': round(float(measurement.get('expert_target_speed', 0.0)), 4),
         'will_collide': self.plan_safety_safe_label,
@@ -798,11 +808,12 @@ class TransfuserDataAgent(SensorAgent):
                                        collision_region_radius):
     current_speed = self._speed_mps(measurement, 'speed')
     target_speed = self._speed_mps(measurement, 'target_speed')
-    waypoints = measurement.get('route', [])[:self.config.pred_len]
+    waypoints, plan_waypoint_source = self._plan_waypoints_from_measurement(measurement)
     straight_rollout = self._straight_waypoint_rollout(waypoints)
     detail = {
         'current_speed': round(current_speed, 4),
         'target_speed': round(target_speed, 4),
+        'plan_waypoint_source': plan_waypoint_source,
         'straight_waypoint_rollout': straight_rollout,
         'collision_point_same_lane_with_straight_waypoints': False,
         'collision_case_excluded_straight': False,

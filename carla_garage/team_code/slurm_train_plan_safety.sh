@@ -28,5 +28,5 @@ torchrun --nnodes=1 --nproc_per_node=1 --max_restarts=0 --rdzv_id=$SLURM_JOB_ID 
     --use_controller_input_prediction 1 --continue_epoch 0 --cpu_cores 32 --num_repetitions 1 --use_cosine_schedule 1 --cosine_t0 1 \
     --image_architecture regnety_032 --lidar_architecture regnety_032 \
     --use_mode_prediction 1 --mode_prediction_type plan_safety --plan_safety_labeled_frames_only 1 \
-    --plan_safety_loss_weights 4.0 1.0 --freeze_except_mode_prediction_network 1 \
+    --plan_safety_loss_weights 5.0 1.0 --freeze_except_mode_prediction_network 1 \
     --load_file /home/ec2-user/AD_challenge/experiments/pretrained_baseline/model_0030_0.pth
