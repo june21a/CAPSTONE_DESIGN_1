@@ -427,6 +427,8 @@ class StatisticsManager(object):
         else:
             raise ValueError("Not enough entries in the route record")
 
+        return route_record
+
     def compute_global_statistics(self):
         """Computes and saves the global statistics of the routes"""
         def get_infractions_value(route_record, key):

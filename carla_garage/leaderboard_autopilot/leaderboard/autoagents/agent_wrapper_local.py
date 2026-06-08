@@ -10,6 +10,7 @@ Wrapper for autonomous agents required for tracking and checking of used sensors
 """
 
 from __future__ import print_function
+import inspect
 import math
 import os
 import time
@@ -144,8 +145,9 @@ class AgentWrapper(object):
         """
         Pass the call directly to the agent
         """
-        return self._agent(self.sensor_list_names)
-        # return self._agent()
+        if len(inspect.signature(self._agent.__call__).parameters) > 0:
+            return self._agent(self.sensor_list_names)
+        return self._agent()
 
     def _preprocess_sensor_spec(self, sensor_spec):
         type_ = sensor_spec["type"]
@@ -272,6 +274,7 @@ class AgentWrapper(object):
         # Some sensors miss sending data during the first ticks, so tick several times and remove the data
         for _ in range(10):
             world.tick()
+        self._agent.sensor_interface.clear_data()
 
     def cleanup(self):
         """

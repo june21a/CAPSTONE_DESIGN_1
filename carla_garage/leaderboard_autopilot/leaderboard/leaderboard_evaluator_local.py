@@ -140,7 +140,13 @@ class LeaderboardEvaluator(object):
 
         try:
             if self.agent_instance:
-                self.agent_instance.destroy(results)
+                try:
+                    self.agent_instance.destroy(results)
+                except TypeError as exc:
+                    try:
+                        self.agent_instance.destroy()
+                    except TypeError:
+                        raise exc
                 del self.agent_instance
         except Exception as e:
             print("\n\033[91mFailed to stop the agent:")

@@ -505,7 +505,7 @@ def main():
     parser.add_argument("--debug-checkpoint", type=str, default='./live_results.txt',
                         help="Path to checkpoint used for saving live results")
     parser.add_argument('--use_heuristic', type=int, default=0,
-                        help='Use heuristic for STOP mode: make ego vehicle target speed 0 for 2 seconds when STOP mode is predicted')
+                        help='Use heuristic for STOP mode: make ego vehicle target speed 0 for 1 second when STOP mode is predicted, with a 3 second reactivation cooldown')
 
     arguments = parser.parse_args()
 

@@ -5,29 +5,30 @@ CURRENT_DIR=$(pwd)
 export CARLA_ROOT="${CURRENT_DIR}/carla_garage/carla"
 export WORK_DIR="${CURRENT_DIR}/carla_garage"
 
-export SCENARIO_RUNNER_ROOT="${WORK_DIR}/scenario_runner"
-export LEADERBOARD_ROOT="${WORK_DIR}/leaderboard"
+export SCENARIO_RUNNER_ROOT="${WORK_DIR}/scenario_runner_autopilot"
+export LEADERBOARD_ROOT="${WORK_DIR}/leaderboard_autopilot"
 
 # ===== PYTHONPATH =====
 export PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${SCENARIO_RUNNER_ROOT}:${LEADERBOARD_ROOT}:${PYTHONPATH}"
 
 # ===== Path Settings =====
 CARLA_GARAGE_DIR="${CURRENT_DIR}/carla_garage"
-AGENT_CONFIG="/home/ec2-user/AD_challenge/experiments/pretrained_plan_safety"
-AGENT="./team_code/comparison_agent.py"
-ROUTES="./leaderboard/data/bench2drive220_test_sample_55.xml"
-SAVE_PATH_DIR="./results/pretrained_plan_safety_heuristic_b2d55"
+AGENT_CONFIG="/home/ec2-user/AD_challenge/experiments/pretrained_baseline"
+AGENT="./team_code/transfuser_datagen_agent.py"
+ROUTES="/home/ec2-user/AD_challenge/CAPSTONE_DESIGN_1/carla_garage/leaderboard/data/bench2drive220.xml"
+SAVE_PATH_DIR="./results/pretrained_baseline_training_data"
 CHECKPOINT="${SAVE_PATH_DIR}/debug_results.json"
 RESUME=1
-USE_HEURISTIC=1
 
 # ===== Environment Variables =====
 export DEBUG_CHALLENGE=1
+export DATAGEN=1
 export SAVE_PATH="${SAVE_PATH_DIR}"
-export COLLECT_SENSOR_DATA=1
+export COLLECT_SENSOR_DATA=0
 export ATTENTION_VIS=0
 export VISION_TASK_VIS=0
 export ATTENTION_SAVE_FREQ=1
+export DELETE_ROUTE_FOLDER_WITHOUT_COLLISION=1
 export DISABLE_CUDNN=0
 export FORCE_CPU=0
 
@@ -35,10 +36,9 @@ export FORCE_CPU=0
 cd "${CARLA_GARAGE_DIR}" || exit
 
 # ===== Run =====
-exec python ./leaderboard/leaderboard/leaderboard_evaluator_local.py \
+exec python ./leaderboard_autopilot/leaderboard/leaderboard_evaluator_local.py \
     --agent-config "${AGENT_CONFIG}" \
     --agent "${AGENT}" \
     --routes "${ROUTES}" \
     --checkpoint "${CHECKPOINT}" \
-    --resume "${RESUME}" \
-    --use_heuristic "${USE_HEURISTIC}"
+    --resume "${RESUME}"

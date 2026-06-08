@@ -796,6 +796,45 @@ class Engine(object):
 
     self.detailed_loss_weights = config.detailed_loss_weights
 
+  def _mode_prediction_class_names(self):
+    if self.config.mode_prediction_type == 'plan_safety':
+      return ('unsafe', 'safe')
+    return ('stop', 'move')
+
+  def _compute_mode_prediction_metrics(self, pred_mode, mode_label):
+    metrics = defaultdict(float)
+    if not self.config.use_mode_prediction or pred_mode is None or mode_label is None:
+      return metrics
+
+    mode_logits = pred_mode[0] if isinstance(pred_mode, tuple) else pred_mode
+    mode_pred = torch.argmax(mode_logits, dim=1)
+    correct = mode_pred == mode_label
+
+    metrics['mode_prediction_correct'] = float(correct.sum().item())
+    metrics['mode_prediction_total'] = float(mode_label.numel())
+    for class_idx, class_name in enumerate(self._mode_prediction_class_names()):
+      class_mask = mode_label == class_idx
+      metrics[f'mode_prediction_{class_name}_correct'] = float((correct & class_mask).sum().item())
+      metrics[f'mode_prediction_{class_name}_total'] = float(class_mask.sum().item())
+
+    return metrics
+
+  def _add_mode_prediction_accuracy_metrics(self, detailed_losses_epoch, mode_metrics_epoch, num_batches):
+    if not self.config.use_mode_prediction:
+      return
+
+    metric_prefix = self.config.mode_prediction_type
+    total = mode_metrics_epoch.get('mode_prediction_total', 0.0)
+    if total > 0.0:
+      detailed_losses_epoch[f'{metric_prefix}_accuracy'] = (
+          mode_metrics_epoch['mode_prediction_correct'] / total * num_batches)
+
+    for class_name in self._mode_prediction_class_names():
+      class_total = mode_metrics_epoch.get(f'mode_prediction_{class_name}_total', 0.0)
+      if class_total > 0.0:
+        detailed_losses_epoch[f'{metric_prefix}_{class_name}_accuracy'] = (
+            mode_metrics_epoch[f'mode_prediction_{class_name}_correct'] / class_total * num_batches)
+
   def load_data_compute_loss(self, data, validation=False):
     # Validation = True will compute additional metrics not used for optimization
     # Load data used in both methods
@@ -845,6 +884,7 @@ class Engine(object):
       mode_label = data['mode_label'].to(self.device, dtype=torch.long)
     else:
       mode_label = None
+    pred_mode = None
     # Load model specific data and execute model
     if self.config.use_plant:
       checkpoint = data['route'][:, :self.config.num_route_points].to(self.device, dtype=torch.float32)
@@ -941,6 +981,8 @@ class Engine(object):
 
     # Compute metrics for logging
     metrics = {}
+    if self.config.use_mode_prediction:
+      metrics.update(self._compute_mode_prediction_metrics(pred_mode, mode_label))
     if validation:
       if self.config.use_semantic and not self.config.use_plant:
         ss_miou = torchmetrics.functional.jaccard_index(pred_semantic,
@@ -1003,13 +1045,14 @@ class Engine(object):
     num_batches = 0
     loss_epoch = 0.0
     detailed_losses_epoch = {key: 0.0 for key in self.detailed_loss_weights}
+    mode_metrics_epoch = defaultdict(float)
     self.optimizer.zero_grad(set_to_none=False)
 
     # Train loop
     for i, data in enumerate(tqdm(self.dataloader_train, disable=self.rank != 0)):
 
       with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=bool(self.config.use_amp)):
-        losses, _ = self.load_data_compute_loss(data, validation=False)
+        losses, metrics = self.load_data_compute_loss(data, validation=False)
         loss = torch.zeros(1, dtype=torch.float32, device=self.device)
 
         for key, value in losses.items():
@@ -1020,6 +1063,12 @@ class Engine(object):
           else:
             loss += self.detailed_loss_weights[key] * value
             detailed_losses_epoch[key] += float(self.detailed_loss_weights[key] * float(value.item()))
+
+        for key, value in metrics.items():
+          if key.startswith('mode_prediction_'):
+            mode_metrics_epoch[key] += float(value)
+          else:
+            detailed_losses_epoch[key] += float(value)
 
       self.scaler.scale(loss).backward()
 
@@ -1044,6 +1093,7 @@ class Engine(object):
     self.optimizer.zero_grad(set_to_none=True)
     torch.cuda.empty_cache()
 
+    self._add_mode_prediction_accuracy_metrics(detailed_losses_epoch, mode_metrics_epoch, num_batches)
     self.log_losses(loss_epoch, detailed_losses_epoch, num_batches, '')
 
   @torch.inference_mode()
@@ -1053,6 +1103,7 @@ class Engine(object):
     num_batches = 0
     loss_epoch = 0.0
     detailed_val_losses_epoch = defaultdict(float)
+    mode_metrics_epoch = defaultdict(float)
 
     # Evaluation loop loop
     for data in tqdm(self.dataloader_val, disable=self.rank != 0):
@@ -1071,7 +1122,10 @@ class Engine(object):
           detailed_val_losses_epoch[key] += float(self.detailed_loss_weights[key] * float(value.item()))
 
       for key, value in metrics.items():
-        detailed_val_losses_epoch[key] += float(value)
+        if key.startswith('mode_prediction_'):
+          mode_metrics_epoch[key] += float(value)
+        else:
+          detailed_val_losses_epoch[key] += float(value)
 
       num_batches += 1
       loss_epoch += float(loss.item())
@@ -1079,6 +1133,7 @@ class Engine(object):
       del losses
       del metrics
 
+    self._add_mode_prediction_accuracy_metrics(detailed_val_losses_epoch, mode_metrics_epoch, num_batches)
     self.log_losses(loss_epoch, detailed_val_losses_epoch, num_batches, 'val_')
 
   def log_losses(self, loss_epoch, detailed_losses_epoch, num_batches, prefix=''):

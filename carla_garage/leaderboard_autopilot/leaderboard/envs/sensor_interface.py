@@ -199,7 +199,7 @@ class SensorInterface(object):
     def __init__(self):
         self._sensors_objects = {}
         self._data_buffers = Queue()
-        self._queue_timeout = 10
+        self._queue_timeout = float(os.environ.get('SENSOR_QUEUE_TIMEOUT', 10))
 
         # Only sensor that doesn't get the data on tick, needs special treatment
         self._opendrive_tag = None
@@ -219,8 +219,17 @@ class SensorInterface(object):
 
         self._data_buffers.put((tag, frame, data))
 
+    def clear_data(self):
+        """Drop pending sensor packages, typically after setup warmup ticks."""
+        try:
+            while True:
+                self._data_buffers.get_nowait()
+        except Empty:
+            pass
+
     def get_data(self, frame):
         """Read the queue to get the sensors data"""
+        stale_frames = {}
         try:
             data_dict = {}
             while len(data_dict.keys()) < len(self._sensors_objects.keys()):
@@ -231,10 +240,29 @@ class SensorInterface(object):
 
                 sensor_data = self._data_buffers.get(True, self._queue_timeout)
                 if sensor_data[1] != frame:
+                    tag, stale_frame = sensor_data[0], sensor_data[1]
+                    stale_frames[tag] = stale_frame
                     continue
                 data_dict[sensor_data[0]] = ((sensor_data[1], sensor_data[2]))
 
         except Empty:
-            raise SensorReceivedNoData("A sensor took too long to send their data")
+            expected_tags = set(self._sensors_objects.keys())
+            missing_tags = sorted(expected_tags - set(data_dict.keys()))
+            received_tags = sorted(data_dict.keys())
+            stale_summary = ', '.join(
+                '{}:{}'.format(tag, stale_frame) for tag, stale_frame in sorted(stale_frames.items())
+            )
+            if not stale_summary:
+                stale_summary = 'none'
+            raise SensorReceivedNoData(
+                "Sensor data timeout at frame {} after {:.1f}s. Missing sensors: {}. "
+                "Received sensors: {}. Latest stale frames consumed: {}.".format(
+                    frame,
+                    self._queue_timeout,
+                    missing_tags,
+                    received_tags,
+                    stale_summary
+                )
+            )
 
         return data_dict

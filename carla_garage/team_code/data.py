@@ -99,6 +99,23 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
           skipped_routes += 1
           continue
 
+        plan_safety_labeled_frames = None
+        plan_safety_labeled_only = (
+            self.config.use_mode_prediction and self.config.mode_prediction_type == 'plan_safety' and
+            getattr(self.config, 'plan_safety_labeled_frames_only', False)
+        )
+        if plan_safety_labeled_only:
+          plan_safety_label_path = route_dir + '/plan_safety_labels.json.gz'
+          if not os.path.isfile(plan_safety_label_path):
+            skipped_routes += 1
+            continue
+          with gzip.open(plan_safety_label_path, 'rt', encoding='utf-8') as f:
+            plan_safety_labels_i = ujson.load(f)
+          plan_safety_labeled_frames = set(plan_safety_labels_i.get('frames', {}).keys())
+          if not plan_safety_labeled_frames:
+            skipped_routes += 1
+            continue
+
         # We skip data where the expert did not achieve perfect driving score (except for min speed infractions)
         with gzip.open(route_dir + '/results.json.gz', 'rt', encoding='utf-8') as f:
           results_route = ujson.load(f)
@@ -109,9 +126,12 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
         condition4 = results_route['status'] == 'Failed - Simulation crashed'
         condition5 = results_route['status'] == 'Failed - Agent crashed'
         allow_failed_driving_route = bool(self.config.freeze_except_mode_prediction_network and condition3)
+        allow_plan_safety_labeled_route = bool(plan_safety_labeled_only)
         if condition2 or condition4 or condition5:
           continue
-        if condition3 and allow_failed_driving_route:
+        if allow_plan_safety_labeled_route:
+          pass
+        elif condition3 and allow_failed_driving_route:
           pass
         elif condition1 or condition3:
           continue
@@ -123,19 +143,6 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
           skipped_routes += 1
           continue
         num_seq = len(os.listdir(lidar_dir))
-        plan_safety_labeled_frames = None
-        if (self.config.use_mode_prediction and self.config.mode_prediction_type == 'plan_safety' and
-            getattr(self.config, 'plan_safety_labeled_frames_only', False)):
-          plan_safety_label_path = route_dir + '/plan_safety_labels.json.gz'
-          if not os.path.isfile(plan_safety_label_path):
-            skipped_routes += 1
-            continue
-          with gzip.open(plan_safety_label_path, 'rt', encoding='utf-8') as f:
-            plan_safety_labels_i = ujson.load(f)
-          plan_safety_labeled_frames = set(plan_safety_labels_i.get('frames', {}).keys())
-          if not plan_safety_labeled_frames:
-            skipped_routes += 1
-            continue
 
         # If we are using checkpoints to predict the path, we can use all of the frames, otherwise we need to subtract
         # pred_len so that we have enough waypoint labels

@@ -129,7 +129,7 @@ class LeaderboardEvaluator(object):
             return self._agent_watchdog.get_status()
         return False
 
-    def _cleanup(self):
+    def _cleanup(self, results=None):
         """
         Remove and destroy all actors
         """
@@ -140,7 +140,13 @@ class LeaderboardEvaluator(object):
 
         try:
             if self.agent_instance:
-                self.agent_instance.destroy()
+                try:
+                    self.agent_instance.destroy(results)
+                except TypeError as exc:
+                    try:
+                        self.agent_instance.destroy()
+                    except TypeError:
+                        raise exc
                 self.agent_instance = None
         except Exception as e:
             print("\n\033[91mFailed to stop the agent:")
@@ -238,9 +244,10 @@ class LeaderboardEvaluator(object):
         """
         print("\033[1m> Registering the route statistics\033[0m")
         self.statistics_manager.save_entry_status(entry_status)
-        self.statistics_manager.compute_route_statistics(
+        route_record = self.statistics_manager.compute_route_statistics(
             route_index, self.manager.scenario_duration_system, self.manager.scenario_duration_game, crash_message
         )
+        return route_record
 
     def _load_and_run_scenario(self, args, config):
         """
@@ -272,8 +279,8 @@ class LeaderboardEvaluator(object):
             print(f"\n{traceback.format_exc()}\033[0m")
 
             entry_status, crash_message = FAILURE_MESSAGES["Simulation"]
-            self._register_statistics(config.index, entry_status, crash_message)
-            self._cleanup()
+            result = self._register_statistics(config.index, entry_status, crash_message)
+            self._cleanup(result)
             return True
 
         print("\033[1m> Setting up the agent\033[0m")
@@ -317,8 +324,8 @@ class LeaderboardEvaluator(object):
             print(f"{e}\033[0m\n")
 
             entry_status, crash_message = FAILURE_MESSAGES["Sensors"]
-            self._register_statistics(config.index, entry_status, crash_message)
-            self._cleanup()
+            result = self._register_statistics(config.index, entry_status, crash_message)
+            self._cleanup(result)
             return True
 
         except Exception:
@@ -327,8 +334,8 @@ class LeaderboardEvaluator(object):
             print(f"\n{traceback.format_exc()}\033[0m")
 
             entry_status, crash_message = FAILURE_MESSAGES["Agent_init"]
-            self._register_statistics(config.index, entry_status, crash_message)
-            self._cleanup()
+            result = self._register_statistics(config.index, entry_status, crash_message)
+            self._cleanup(result)
             return False
 
         print("\033[1m> Running the route\033[0m")
@@ -358,12 +365,12 @@ class LeaderboardEvaluator(object):
         try:
             print("\033[1m> Stopping the route\033[0m")
             self.manager.stop_scenario()
-            self._register_statistics(config.index, entry_status, crash_message)
+            result = self._register_statistics(config.index, entry_status, crash_message)
 
             if args.record:
                 self.client.stop_recorder()
 
-            self._cleanup()
+            self._cleanup(result)
 
         except Exception:
             print("\n\033[91mFailed to stop the scenario, the statistics might be empty:")

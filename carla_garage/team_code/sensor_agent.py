@@ -93,6 +93,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     self.initialized = False
     self.stop_mode_active_prev = False
     self.stop_mode_zero_until = None
+    self.stop_mode_cooldown_until = 0.0
     self.device = torch.device('cpu' if self.force_cpu else 'cuda:0')
     print('Evaluation device: ', self.device)
 
@@ -616,6 +617,9 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     for path in self.vision_task_paths.values():
       path.mkdir(parents=True, exist_ok=True)
 
+  def _on_plan_safety_candidate(self, tick_data, waypoints, target_speed, control):
+    pass
+
   def _init(self):
     # The CARLA leaderboard does not expose the lat lon reference value of the GPS which make it impossible to use the
     # GPS because the scale is not known. In the past this was not an issue since the reference was constant 0.0
@@ -725,6 +729,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
           'roll': self.config.lidar_rot[0],
           'pitch': self.config.lidar_rot[1],
           'yaw': self.config.lidar_rot[2],
+          'rotation_frequency': self.config.lidar_rotation_frequency,
+          'points_per_second': self.config.lidar_points_per_second,
           'id': 'lidar'
       })
 
@@ -820,6 +826,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
   @torch.inference_mode()  # Turns off gradient computation
   def run_step(self, input_data, timestamp, sensors=None, use_heuristic=False):  # pylint: disable=locally-disabled, unused-argument
+    use_heuristic = bool(use_heuristic or getattr(self, 'use_heuristic', False))
     self.step += 1
 
     if not self.initialized:
@@ -1017,12 +1024,12 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         
         if use_heuristic:
           stop_mode_active = pred_mode_ensemble[0].item() >= stop_threshold
-          if stop_mode_active and not self.stop_mode_active_prev:
-            current_game_time = float(timestamp) if timestamp is not None else self.step * self.config.carla_frame_rate
-            self.stop_mode_zero_until = current_game_time + 2.0
-          self.stop_mode_active_prev = stop_mode_active
-
           current_game_time = float(timestamp) if timestamp is not None else self.step * self.config.carla_frame_rate
+          can_activate_stop_mode = current_game_time >= self.stop_mode_cooldown_until
+          if stop_mode_active and can_activate_stop_mode:
+            self.stop_mode_zero_until = current_game_time + 2.0 # 40frame
+            self.stop_mode_cooldown_until = self.stop_mode_zero_until + 3.0 # 60frame
+
           if self.stop_mode_zero_until is not None and current_game_time < self.stop_mode_zero_until:
             pred_target_speed_scalar = self.inference_target_speeds[0]
         else:
@@ -1073,8 +1080,10 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     if self.config.inference_direct_controller and self.config.use_controller_input_prediction:
       pred_checkpoints = torch.stack(pred_checkpoints, dim=0).mean(dim=0).detach().cpu().numpy()
+      plan_safety_waypoints = pred_checkpoints
       steer, throttle, brake = self.nets[0].control_pid_direct(pred_checkpoints, pred_target_speed_scalar, gt_velocity)
     elif self.config.use_wp_gru and not self.config.inference_direct_controller:
+      plan_safety_waypoints = self.pred_wp.detach().cpu().numpy()[0]
       steer, throttle, brake = self.nets[0].control_pid(self.pred_wp,
                                                         gt_velocity,
                                                         tuned_aim_distance=bool(self.tuned_aim_distance))
@@ -1132,6 +1141,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       brake = True
 
     control = carla.VehicleControl(steer=float(steer), throttle=float(throttle), brake=float(brake))
+    self._on_plan_safety_candidate(tick_data, plan_safety_waypoints, pred_target_speed_scalar, control)
     self._save_sensor_attention_data(tick_data, lidar_bev, rgb_attention_map, lidar_attention_map, control,
                                      pred_target_speed_scalar)
     self._save_vision_task_data(tick_data, lidar_bev, pred_semantic, pred_bev_semantic, pred_depth,
@@ -1261,6 +1271,11 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     Also writes logging files to disk.
     """
     if getattr(self, 'save_path', None) is not None:
+      if results is not None:
+        results_dict = results.to_json() if hasattr(results, 'to_json') else getattr(results, '__dict__', results)
+        with gzip.open(self.save_path / 'results.json.gz', 'wt', encoding='utf-8') as f:
+          ujson.dump(results_dict, f, indent=2)
+
       if getattr(self, 'lon_logger', None) is not None:
         self.lon_logger.dump_to_json()
       if getattr(self, 'nets', None) and len(self.nets[0].speed_histogram) > 0:
