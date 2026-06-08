@@ -184,6 +184,10 @@ class ScenarioManager(object):
                 self._agent_watchdog.update()
                 ego_action = self._agent_wrapper()
                 self._agent_watchdog.pause()
+                agent_stop_requested = (
+                    os.environ.get('DATAGEN', '0') == '1' and
+                    bool(getattr(getattr(self._agent_wrapper, '_agent', None), 'datagen_stop_requested', False))
+                )
 
             # Special exception inside the agent that isn't caused by the agent
             except SensorReceivedNoData as e:
@@ -228,6 +232,9 @@ class ScenarioManager(object):
                     self._post_collision_end_time - timestamp.elapsed_seconds))
 
             if self._post_collision_end_time is not None and timestamp.elapsed_seconds >= self._post_collision_end_time:
+                self._running = False
+            elif agent_stop_requested:
+                print("Datagen agent requested scenario finish after detecting stuck vehicle.")
                 self._running = False
             elif self.scenario_tree.status != py_trees.common.Status.RUNNING:
                 self._running = False

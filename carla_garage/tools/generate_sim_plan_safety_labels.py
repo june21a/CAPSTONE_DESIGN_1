@@ -40,8 +40,9 @@ DEFAULT_MAX_DECELERATION = 4.82
 DEFAULT_COLLISION_REGION_RADIUS = float(np.linalg.norm(DEFAULT_EGO_EXTENT))
 STRAIGHT_WAYPOINT_MAX_LATERAL_SPREAD = 0.5
 STRAIGHT_WAYPOINT_MAX_HEADING_CHANGE_DEG = 5.0
-COLLISION_POINT_SAME_LANE_LATERAL_MARGIN = float(DEFAULT_EGO_EXTENT[1]) + 0.5
 MAX_CHECKED_FRAMES_BEFORE_EVENT = 10
+DEFAULT_NONZERO_STEER_THRESHOLD = 1e-3
+COLLISION_REGION_EGO_BOX_SAMPLE_SPACING = 0.5
 
 
 def load_json_gz(path: Path) -> Any:
@@ -55,6 +56,9 @@ def dump_json_gz(path: Path, data: Any) -> None:
 
 
 def iter_route_dirs(data_root: Path):
+    for measurements_dir in data_root.glob("*/measurements"):
+        if measurements_dir.is_dir():
+            yield measurements_dir.parent
     for measurements_dir in data_root.glob("*/*/measurements"):
         if measurements_dir.is_dir():
             yield measurements_dir.parent
@@ -128,65 +132,125 @@ def actor_pose_in_origin(origin_matrix: np.ndarray, actor: dict[str, Any]) -> tu
     return float(relative_matrix[0, 3]), float(relative_matrix[1, 3]), yaw
 
 
-def infer_collision_data_frame_from_location(
+def infer_collision_data_frames_from_locations(
     paths: list[Path],
     measurements: list[dict[str, Any]],
     locations: list[tuple[float, float, float]],
     max_distance: float,
-) -> tuple[int | None, float | None]:
-    if not locations:
-        return None, None
-
-    best_frame = None
-    best_distance = None
-    for path, measurement in zip(paths, measurements):
-        position = measurement_position(measurement)
-        if position is None:
-            continue
-        frame = int(path.stem.split(".")[0])
-        for location in locations:
+) -> list[dict[str, Any]]:
+    events = []
+    for location_index, location in enumerate(locations):
+        best_frame = None
+        best_distance = None
+        for path, measurement in zip(paths, measurements):
+            position = measurement_position(measurement)
+            if position is None:
+                continue
+            frame = int(path.stem.split(".")[0])
             distance = math.hypot(position[0] - location[0], position[1] - location[1])
             if best_distance is None or distance < best_distance:
                 best_distance = distance
                 best_frame = frame
 
-    if best_distance is None or best_distance > max_distance:
-        return None, best_distance
-    return best_frame, best_distance
+        if best_frame is None or best_distance is None or best_distance > max_distance:
+            events.append({
+                "frame": None,
+                "source": None,
+                "location_distance": best_distance,
+                "location_index": location_index,
+                "location": list(location),
+            })
+            continue
+
+        events.append({
+            "frame": best_frame,
+            "source": "infraction_location_nearest_ego_pose",
+            "location_distance": best_distance,
+            "location_index": location_index,
+            "location": list(location),
+        })
+    return events
 
 
-def collision_data_frame(
+def frame_in_measurement_paths(frame: int | None, paths: list[Path]) -> bool:
+    if frame is None:
+        return False
+    frame_key = f"{int(frame):04}"
+    return any(path.stem.split(".")[0] == frame_key for path in paths)
+
+
+def deduplicate_collision_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_frame: dict[int, dict[str, Any]] = {}
+    unresolved = []
+    for event in events:
+        frame = event.get("frame")
+        if frame is None:
+            unresolved.append(event)
+            continue
+        frame = int(frame)
+        existing = by_frame.get(frame)
+        if existing is None:
+            event["frame"] = frame
+            by_frame[frame] = event
+            continue
+
+        existing_distance = existing.get("location_distance")
+        event_distance = event.get("location_distance")
+        if existing_distance is None and event_distance is not None:
+            by_frame[frame] = event
+        elif existing_distance is not None and event_distance is not None and event_distance < existing_distance:
+            by_frame[frame] = event
+
+    resolved = sorted(by_frame.values(), key=lambda event: int(event["frame"]))
+    return resolved + unresolved
+
+
+def collision_data_events(
     results: dict[str, Any] | None,
     paths: list[Path],
     measurements: list[dict[str, Any]],
     infer_from_location: bool,
     max_location_distance: float,
     data_save_freq: int,
-) -> tuple[int | None, str | None, float | None]:
+) -> list[dict[str, Any]]:
     if results is None:
-        return None, None, None
+        return []
 
+    events: list[dict[str, Any]] = []
     meta = results.get("meta", {})
-    collision_frame = meta.get("collision_frame")
-    if collision_frame is not None:
-        return int(collision_frame) // int(data_save_freq), "meta.collision_frame", None
-
     data_frame = meta.get("collision_data_frame")
     if data_frame is not None:
-        return int(data_frame), "meta.collision_data_frame", None
+        data_frame = int(data_frame)
+        if frame_in_measurement_paths(data_frame, paths):
+            events.append({
+                "frame": data_frame,
+                "source": "meta.collision_data_frame",
+                "location_distance": None,
+                "location_index": None,
+                "location": None,
+            })
 
-    if not infer_from_location:
-        return None, None, None
+    collision_frame = meta.get("collision_frame")
+    if collision_frame is not None:
+        collision_data_frame = int(collision_frame) // int(data_save_freq)
+        if frame_in_measurement_paths(collision_data_frame, paths):
+            events.append({
+                "frame": collision_data_frame,
+                "source": "meta.collision_frame",
+                "location_distance": None,
+                "location_index": None,
+                "location": None,
+            })
 
-    frame, distance = infer_collision_data_frame_from_location(
-        paths,
-        measurements,
-        collision_locations(results),
-        max_location_distance,
-    )
-    if frame is None:
-        return None, None, distance
-    return frame, "infraction_location_nearest_ego_pose", distance
+    if infer_from_location:
+        events.extend(infer_collision_data_frames_from_locations(
+            paths,
+            measurements,
+            collision_locations(results),
+            max_location_distance,
+        ))
+
+    return deduplicate_collision_events(events)
 
 
 def measurement_paths(route_dir: Path):
@@ -218,6 +282,40 @@ def speed_mps(measurement: dict[str, Any], key: str, default: float = 0.0) -> fl
         return max(0.0, float(measurement.get(key, default) or default))
     except (TypeError, ValueError):
         return default
+
+
+def steer_value(measurement: dict[str, Any], default: float = 0.0) -> float:
+    try:
+        return float(measurement.get("steer", default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def consecutive_nonzero_steer_run_lengths(
+    paths: list[Path],
+    measurements: list[dict[str, Any]],
+    nonzero_threshold: float,
+) -> dict[str, int]:
+    run_lengths: dict[str, int] = {}
+    run_frame_keys: list[str] = []
+    threshold = max(0.0, float(nonzero_threshold))
+
+    def flush_run() -> None:
+        if not run_frame_keys:
+            return
+        run_length = len(run_frame_keys)
+        for run_frame_key in run_frame_keys:
+            run_lengths[run_frame_key] = run_length
+        run_frame_keys.clear()
+
+    for path, measurement in zip(paths, measurements):
+        frame_key = path.stem.split(".")[0]
+        if abs(steer_value(measurement)) > threshold:
+            run_frame_keys.append(frame_key)
+        else:
+            flush_run()
+    flush_run()
+    return run_lengths
 
 
 def measurement_frame_map(
@@ -317,33 +415,85 @@ def path_points_from_waypoints(waypoints: list[Any]) -> np.ndarray:
     return np.asarray(points, dtype=np.float64)
 
 
-def path_distance_to_region(points: np.ndarray, center: np.ndarray, radius: float) -> float | None:
+def normalize_ego_extent(ego_extent: list[float] | np.ndarray | None) -> np.ndarray:
+    if ego_extent is None:
+        return DEFAULT_EGO_EXTENT.astype(np.float64)
+    try:
+        extent = np.asarray(ego_extent, dtype=np.float64)
+    except (TypeError, ValueError):
+        return DEFAULT_EGO_EXTENT.astype(np.float64)
+    if len(extent) < 2:
+        return DEFAULT_EGO_EXTENT.astype(np.float64)
+    return np.maximum(0.0, extent[:2])
+
+
+def ego_box_intersects_circle(
+    position: np.ndarray,
+    yaw: float,
+    extent: np.ndarray,
+    center: np.ndarray,
+    radius: float,
+) -> bool:
+    delta = center - position
+    cos_yaw = math.cos(-yaw)
+    sin_yaw = math.sin(-yaw)
+    local_x = cos_yaw * float(delta[0]) - sin_yaw * float(delta[1])
+    local_y = sin_yaw * float(delta[0]) + cos_yaw * float(delta[1])
+    clamped_x = float(np.clip(local_x, -extent[0], extent[0]))
+    clamped_y = float(np.clip(local_y, -extent[1], extent[1]))
+    distance = math.hypot(local_x - clamped_x, local_y - clamped_y)
+    return distance <= max(0.0, float(radius))
+
+
+def path_distance_to_region(
+    points: np.ndarray,
+    center: np.ndarray,
+    radius: float,
+    ego_extent: list[float] | np.ndarray | None = None,
+    sample_spacing: float = COLLISION_REGION_EGO_BOX_SAMPLE_SPACING,
+) -> float | None:
     if len(points) == 0:
         return None
 
+    extent = normalize_ego_extent(ego_extent)
     cumulative_distance = 0.0
     best_distance_along_path = None
+
+    if len(points) == 1:
+        if ego_box_intersects_circle(points[0], 0.0, extent, center, radius):
+            return 0.0
+        return None
+
     for index in range(len(points) - 1):
         start = points[index]
         end = points[index + 1]
         segment = end - start
         segment_length = float(np.linalg.norm(segment))
         if segment_length < 1e-6:
-            distance_to_center = float(np.linalg.norm(center - start))
-            closest_distance_along_path = cumulative_distance
+            yaw = 0.0
+            if index > 0:
+                previous_segment = start - points[index - 1]
+                if float(np.linalg.norm(previous_segment)) > 1e-6:
+                    yaw = math.atan2(float(previous_segment[1]), float(previous_segment[0]))
+            if ego_box_intersects_circle(start, yaw, extent, center, radius):
+                if best_distance_along_path is None or cumulative_distance < best_distance_along_path:
+                    best_distance_along_path = cumulative_distance
         else:
-            projection = float(np.clip(np.dot(center - start, segment) / (segment_length**2), 0.0, 1.0))
-            closest = start + projection * segment
-            distance_to_center = float(np.linalg.norm(center - closest))
-            closest_distance_along_path = cumulative_distance + projection * segment_length
-
-        if distance_to_center <= radius:
-            if best_distance_along_path is None or closest_distance_along_path < best_distance_along_path:
-                best_distance_along_path = closest_distance_along_path
+            yaw = math.atan2(float(segment[1]), float(segment[0]))
+            sample_count = max(1, int(math.ceil(segment_length / max(1e-3, float(sample_spacing)))))
+            for sample_index in range(sample_count + 1):
+                distance_along_segment = min(
+                    segment_length,
+                    segment_length * float(sample_index) / float(sample_count),
+                )
+                position = start + segment * (distance_along_segment / segment_length)
+                distance_along_path = cumulative_distance + distance_along_segment
+                if ego_box_intersects_circle(position, yaw, extent, center, radius):
+                    if best_distance_along_path is None or distance_along_path < best_distance_along_path:
+                        best_distance_along_path = distance_along_path
+                    break
         cumulative_distance += segment_length
 
-    if len(points) == 1 and float(np.linalg.norm(center - points[0])) <= radius:
-        return 0.0
     return best_distance_along_path
 
 
@@ -370,20 +520,6 @@ def straight_waypoint_rollout(
     headings = np.unwrap(np.arctan2(valid_segments[:, 1], valid_segments[:, 0]))
     heading_change = math.degrees(float(headings.max() - headings.min()))
     return heading_change <= max_heading_change_deg
-
-
-def collision_point_same_lane_with_waypoints(
-    waypoints: list[Any],
-    collision_point: np.ndarray,
-    lateral_margin: float = COLLISION_POINT_SAME_LANE_LATERAL_MARGIN,
-) -> bool:
-    points = path_points_from_waypoints(waypoints)
-    if len(points) < 2:
-        return False
-
-    waypoint_lateral_offsets = points[1:, 1]
-    collision_lateral_offset = float(collision_point[1])
-    return bool(np.any(np.abs(waypoint_lateral_offsets - collision_lateral_offset) <= lateral_margin))
 
 
 def velocity_rollout_distance(
@@ -428,6 +564,7 @@ def evaluate_collision_reachability(
     max_deceleration: float,
     rollout_dt: float,
     collision_region_radius: float,
+    ego_extent: list[float] | np.ndarray | None,
     max_checked_frames_before_event: int = MAX_CHECKED_FRAMES_BEFORE_EVENT,
 ) -> tuple[bool, dict[str, Any]]:
     current_speed = speed_mps(measurement, "speed")
@@ -438,8 +575,9 @@ def evaluate_collision_reachability(
         "current_speed": round(current_speed, 4),
         "target_speed": round(target_speed, 4),
         "straight_waypoint_rollout": straight_rollout,
-        "collision_point_same_lane_with_straight_waypoints": False,
-        "collision_case_excluded_straight": False,
+        "collision_region_overlap_test": "ego_box_circle",
+        "ego_extent": normalize_ego_extent(ego_extent).round(4).tolist(),
+        "ego_box_sample_spacing": COLLISION_REGION_EGO_BOX_SAMPLE_SPACING,
         "collision_case_outside_checked_window": False,
         "collision_case_unsafe": False,
         "collision_distance": None,
@@ -461,22 +599,22 @@ def evaluate_collision_reachability(
     if collision_point is None:
         return False, detail
 
-    same_lane_collision_point = collision_point_same_lane_with_waypoints(waypoints, collision_point)
-    detail["collision_point_same_lane_with_straight_waypoints"] = same_lane_collision_point
-    if straight_rollout and not same_lane_collision_point:
-        detail["collision_case_excluded_straight"] = True
-        return False, detail
-
     collision_distance = float(np.linalg.norm(collision_point))
     time_to_collision = (collision_frame - frame) * max(1, int(data_save_freq)) / max(sim_fps, 1e-6)
     detail["collision_distance"] = round(collision_distance, 4)
     detail["time_to_collision"] = round(time_to_collision, 4)
 
     points = path_points_from_waypoints(waypoints)
-    distance_to_region = path_distance_to_region(points, collision_point, max(0.0, collision_region_radius))
+    distance_to_region = path_distance_to_region(
+        points,
+        collision_point,
+        max(0.0, collision_region_radius),
+        ego_extent,
+    )
     if distance_to_region is None:
         return False, detail
-
+    
+    print(frame)
     reachable_distance = velocity_rollout_distance(
         current_speed,
         target_speed,
@@ -491,6 +629,94 @@ def evaluate_collision_reachability(
     detail["reachable_before_collision"] = reachable_distance >= distance_to_region
     detail["collision_case_unsafe"] = bool(detail["reachable_before_collision"])
     return bool(detail["reachable_before_collision"]), detail
+
+
+def evaluate_collision_events_reachability(
+    measurement: dict[str, Any],
+    collision_events: list[dict[str, Any]],
+    frame_to_measurement: dict[int, dict[str, Any]],
+    frame: int,
+    pred_len: int,
+    data_save_freq: int,
+    sim_fps: float,
+    max_acceleration: float,
+    max_deceleration: float,
+    rollout_dt: float,
+    default_collision_region_radius: float,
+    collision_region_radii: dict[int, float],
+    default_ego_extent: list[float] | np.ndarray | None,
+    ego_extents: dict[int, list[float]],
+) -> tuple[bool, dict[str, Any]]:
+    checked_count = 0
+    best_safe_detail = None
+    best_future_frame = None
+    resolved_event_count = sum(1 for event in collision_events if event.get("frame") is not None)
+
+    for event_index, event in enumerate(collision_events):
+        collision_frame = event.get("frame")
+        if collision_frame is None:
+            continue
+        collision_frame = int(collision_frame)
+        if frame >= collision_frame:
+            continue
+        
+        checked_count += 1
+        collision_measurement = frame_to_measurement.get(collision_frame)
+        collision_region_radius = collision_region_radii.get(collision_frame, default_collision_region_radius)
+        ego_extent = ego_extents.get(collision_frame, default_ego_extent)
+        unsafe, detail = evaluate_collision_reachability(
+            measurement,
+            collision_measurement,
+            frame,
+            collision_frame,
+            pred_len,
+            data_save_freq,
+            sim_fps,
+            max_acceleration,
+            max_deceleration,
+            rollout_dt,
+            collision_region_radius,
+            ego_extent,
+        )
+        detail["collision_event_index"] = event_index
+        detail["collision_event_count"] = resolved_event_count
+        detail["checked_future_collision_event_count"] = checked_count
+        detail["collision_event_source"] = event.get("source")
+        detail["collision_event_location_distance"] = event.get("location_distance")
+        detail["collision_event_location_index"] = event.get("location_index")
+
+        if unsafe:
+            return True, detail
+
+        if best_safe_detail is None or collision_frame < best_future_frame:
+            best_safe_detail = detail
+            best_future_frame = collision_frame
+
+    if best_safe_detail is not None:
+        best_safe_detail["checked_future_collision_event_count"] = checked_count
+        return False, best_safe_detail
+
+    _, detail = evaluate_collision_reachability(
+        measurement,
+        None,
+        frame,
+        None,
+        pred_len,
+        data_save_freq,
+        sim_fps,
+        max_acceleration,
+        max_deceleration,
+        rollout_dt,
+        default_collision_region_radius,
+        default_ego_extent,
+    )
+    detail["collision_event_index"] = None
+    detail["collision_event_count"] = resolved_event_count
+    detail["checked_future_collision_event_count"] = checked_count
+    detail["collision_event_source"] = None
+    detail["collision_event_location_distance"] = None
+    detail["collision_event_location_index"] = None
+    return False, detail
 
 
 def candidate_from_measurement(
@@ -515,14 +741,16 @@ def candidate_from_measurement(
 
 def select_safe_frame_keys(
     safe_frame_keys: list[str],
+    steering_safe_frame_keys: list[str],
+    prefer_steering_safe: bool,
     unsafe_count: int,
     route_had_collision: bool,
     safe_samples_per_unsafe: float,
     max_safe_per_non_collision_route: int,
     rng: random.Random,
-) -> set[str]:
+) -> tuple[set[str], str, int]:
     if route_had_collision and unsafe_count == 0:
-        return set()
+        return set(), "none_collision_route_without_unsafe", 0
     if route_had_collision:
         safe_limit = int(round(unsafe_count * safe_samples_per_unsafe))
     else:
@@ -530,8 +758,14 @@ def select_safe_frame_keys(
 
     safe_limit = max(0, min(safe_limit, len(safe_frame_keys)))
     if safe_limit == 0:
-        return set()
-    return set(rng.sample(safe_frame_keys, safe_limit))
+        return set(), "none_safe_limit_zero", safe_limit
+
+    if prefer_steering_safe and steering_safe_frame_keys:
+        selected_count = min(safe_limit, len(steering_safe_frame_keys))
+        return set(rng.sample(steering_safe_frame_keys, selected_count)), "consecutive_nonzero_steer", safe_limit
+
+    selected_source = "random_safe_fallback_no_steering_safe" if prefer_steering_safe else "random_safe"
+    return set(rng.sample(safe_frame_keys, safe_limit)), selected_source, safe_limit
 
 
 def image_point(x: float, y: float, pixels_per_meter: float, min_y: float, max_x: float) -> tuple[int, int]:
@@ -873,6 +1107,8 @@ def label_route(
     collision_region_radius: float | None,
     safe_samples_per_unsafe: float,
     max_safe_per_non_collision_route: int,
+    safe_consecutive_nonzero_steer_frames: int,
+    nonzero_steer_threshold: float,
     seed: int,
     trajectory_visualization_output_dir: Path | None,
     trajectory_visualization_horizon: int,
@@ -917,7 +1153,7 @@ def label_route(
     measurements = [load_json_gz(path) for path in paths]
     results = load_results(route_dir)
     collision = has_collision_result(results)
-    collision_frame, collision_frame_source, collision_location_distance = collision_data_frame(
+    collision_events = collision_data_events(
         results,
         paths,
         measurements,
@@ -925,32 +1161,59 @@ def label_route(
         max_collision_location_distance,
         data_save_freq,
     )
-    unresolved_collision = collision and collision_frame is None
+    resolved_collision_events = [event for event in collision_events if event.get("frame") is not None]
+    primary_collision_event = resolved_collision_events[0] if resolved_collision_events else {}
+    collision_frame = primary_collision_event.get("frame")
+    collision_frame_source = primary_collision_event.get("source")
+    collision_location_distance = primary_collision_event.get("location_distance")
+    collision_frames = [int(event["frame"]) for event in resolved_collision_events]
+    last_collision_frame = max(collision_frames) if collision_frames else None
+    unresolved_collision = collision and not resolved_collision_events
     frame_to_measurement = measurement_frame_map(paths, measurements)
-    collision_measurement = frame_to_measurement.get(collision_frame) if collision_frame is not None else None
     resolved_collision_region_radius, collision_region_radius_source, ego_extent = resolve_collision_region_radius(
         route_dir,
         paths,
         collision_frame,
         collision_region_radius,
     )
+    collision_region_radii = {}
+    collision_region_radius_sources = {}
+    ego_extents_by_frame = {}
+    for event in resolved_collision_events:
+        event_frame = int(event["frame"])
+        event_radius, event_radius_source, event_ego_extent = resolve_collision_region_radius(
+            route_dir,
+            paths,
+            event_frame,
+            collision_region_radius,
+        )
+        collision_region_radii[event_frame] = event_radius
+        collision_region_radius_sources[event_frame] = event_radius_source
+        ego_extents_by_frame[event_frame] = event_ego_extent
     case_label = "collision" if collision else "success"
-
+    safe_consecutive_nonzero_steer_frames = max(0, int(safe_consecutive_nonzero_steer_frames))
+    nonzero_steer_threshold = max(0.0, float(nonzero_steer_threshold))
+    nonzero_steer_run_lengths = consecutive_nonzero_steer_run_lengths(
+        paths,
+        measurements,
+        nonzero_steer_threshold,
+    )
     candidate_frames = []
     safe_frame_keys = []
+    steering_safe_frame_keys = []
     unsafe_count = 0
     for path, measurement in zip(paths, measurements):
         frame_key = path.stem.split(".")[0]
         frame = int(frame_key)
-        if collision_frame is not None and frame >= collision_frame:
+        if last_collision_frame is not None and frame >= last_collision_frame:
             continue
         if not focus_frame(measurement, all_frames):
             continue
-        collision_unsafe, collision_detail = evaluate_collision_reachability(
+        collision_unsafe, collision_detail = evaluate_collision_events_reachability(
             measurement,
-            collision_measurement,
+            resolved_collision_events,
+            frame_to_measurement,
             frame,
-            collision_frame,
             pred_len,
             data_save_freq,
             sim_fps,
@@ -958,18 +1221,35 @@ def label_route(
             max_deceleration,
             rollout_dt,
             resolved_collision_region_radius,
+            collision_region_radii,
+            ego_extent,
+            ego_extents_by_frame,
         )
         unsafe = collision_unsafe
         safety_detail = collision_detail
+        steer = steer_value(measurement)
+        nonzero_steer_run_length = nonzero_steer_run_lengths.get(frame_key, 0)
+        safe_case_from_nonzero_steer_run = (
+            safe_consecutive_nonzero_steer_frames > 0
+            and nonzero_steer_run_length >= safe_consecutive_nonzero_steer_frames
+        )
+        safety_detail["steer"] = round(steer, 4)
+        safety_detail["nonzero_steer_threshold"] = nonzero_steer_threshold
+        safety_detail["nonzero_steer_run_length"] = nonzero_steer_run_length
+        safety_detail["safe_case_from_consecutive_nonzero_steer"] = bool(safe_case_from_nonzero_steer_run)
         candidate = candidate_from_measurement(measurement, pred_len, unsafe, safety_detail)
         candidate_frames.append((frame_key, candidate, unsafe))
         unsafe_count += int(unsafe)
         if not unsafe:
             safe_frame_keys.append(frame_key)
+            if safe_case_from_nonzero_steer_run:
+                steering_safe_frame_keys.append(frame_key)
 
     route_seed = seed + sum(ord(char) for char in str(route_dir))
-    selected_safe_frame_keys = select_safe_frame_keys(
+    selected_safe_frame_keys, selected_safe_source, safe_limit = select_safe_frame_keys(
         safe_frame_keys,
+        steering_safe_frame_keys,
+        safe_consecutive_nonzero_steer_frames > 0,
         unsafe_count,
         collision,
         safe_samples_per_unsafe,
@@ -1015,13 +1295,15 @@ def label_route(
         "collision_data_frame": collision_frame,
         "collision_frame_source": collision_frame_source,
         "collision_location_distance": collision_location_distance,
+        "collision_data_frames": collision_frames,
+        "collision_events": collision_events,
+        "collision_event_count": len(resolved_collision_events),
         "collision_case_unsafe_criterion": (
-            "within_10_frames_before_collision_future_collision_region_intersection_and_velocity_rollout_reachability_excluding_straight_waypoints_unless_collision_point_is_in_same_lane"
+            "within_10_frames_before_each_collision_event_future_collision_region_ego_box_overlap_and_velocity_rollout_reachability"
         ),
         "max_checked_frames_before_event": MAX_CHECKED_FRAMES_BEFORE_EVENT,
         "straight_waypoint_max_lateral_spread": STRAIGHT_WAYPOINT_MAX_LATERAL_SPREAD,
         "straight_waypoint_max_heading_change_deg": STRAIGHT_WAYPOINT_MAX_HEADING_CHANGE_DEG,
-        "collision_point_same_lane_lateral_margin": COLLISION_POINT_SAME_LANE_LATERAL_MARGIN,
         "sim_fps": sim_fps,
         "data_save_freq": data_save_freq,
         "max_acceleration": max_acceleration,
@@ -1029,9 +1311,19 @@ def label_route(
         "rollout_dt": rollout_dt,
         "collision_region_radius": resolved_collision_region_radius,
         "collision_region_radius_source": collision_region_radius_source,
+        "collision_region_radius_by_frame": collision_region_radii,
+        "collision_region_radius_source_by_frame": collision_region_radius_sources,
         "ego_extent": ego_extent,
+        "ego_extent_by_frame": ego_extents_by_frame,
+        "ego_box_sample_spacing": COLLISION_REGION_EGO_BOX_SAMPLE_SPACING,
         "safe_samples_per_unsafe": safe_samples_per_unsafe,
         "max_safe_per_non_collision_route": max_safe_per_non_collision_route,
+        "safe_consecutive_nonzero_steer_frames": safe_consecutive_nonzero_steer_frames,
+        "nonzero_steer_threshold": nonzero_steer_threshold,
+        "safe_candidate_count": len(safe_frame_keys),
+        "steering_safe_candidate_count": len(steering_safe_frame_keys),
+        "selected_safe_candidate_source": selected_safe_source,
+        "selected_safe_candidate_limit": safe_limit,
         "pred_len": pred_len,
         "frames": frames,
     })
@@ -1085,7 +1377,7 @@ def main() -> int:
     parser.add_argument(
         "--collision-region-radius",
         type=float,
-        default=None,
+        default=2.0,
         help=(
             "Optional radius in meters around the future collision pose treated as the collision region. "
             "Defaults to the ego_car extent from dataset boxes, falling back to the built-in ego extent."
@@ -1117,6 +1409,21 @@ def main() -> int:
         type=int,
         default=0,
         help="For routes without collision, save at most this many safe labels.",
+    )
+    parser.add_argument(
+        "--safe-consecutive-nonzero-steer-frames",
+        type=int,
+        default=0,
+        help=(
+            "When greater than 0, only sample safe labels from frames that belong to a run of at least this "
+            "many consecutive saved measurements with abs(steer) greater than --nonzero-steer-threshold."
+        ),
+    )
+    parser.add_argument(
+        "--nonzero-steer-threshold",
+        type=float,
+        default=DEFAULT_NONZERO_STEER_THRESHOLD,
+        help="Absolute steering threshold used by --safe-consecutive-nonzero-steer-frames.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -1206,6 +1513,8 @@ def main() -> int:
             args.collision_region_radius,
             args.safe_samples_per_unsafe,
             args.max_safe_per_non_collision_route,
+            args.safe_consecutive_nonzero_steer_frames,
+            args.nonzero_steer_threshold,
             args.seed,
             trajectory_visualization_output_dir,
             args.trajectory_visualization_horizon,

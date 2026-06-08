@@ -5,6 +5,7 @@ leaderboard/leaderboard/leaderboard_evaluator.py file
 """
 
 import os
+import re
 from copy import deepcopy
 
 import cv2
@@ -175,6 +176,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     self.stuck_detector = 0
     self.force_move = 0
+    self.datagen_stop_requested = False
 
     self.bb_buffer = deque(maxlen=1)
     self.commands = deque(maxlen=2)
@@ -1098,7 +1100,14 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     # Restart mechanism in case the car got stuck. Not used a lot anymore but doesn't hurt to keep it.
     if self.stuck_detector > self.config.stuck_threshold:
-      self.force_move = self.config.creep_duration
+      if os.environ.get('DATAGEN', '0') == '1':
+        print('Detected agent being stuck during datagen. Requesting scenario finish. Step: ', self.step)
+        self.datagen_stop_requested = True
+        throttle = 0.0
+        brake = True
+        self.force_move = 0
+      else:
+        self.force_move = self.config.creep_duration
 
     if self.force_move > 0:
       emergency_stop = False
@@ -1290,12 +1299,73 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
         del self.tp_attention_buffer
 
+      self._rename_datagen_route_folder(results)
+
     if hasattr(self, 'nets'):
       del self.nets
     if hasattr(self, 'config'):
       del self.config
     if hasattr(self, 'metric_info'):
       del self.metric_info
+
+  def _rename_datagen_route_folder(self, results=None):
+    if not strtobool(os.environ.get('DATAGEN', '0')):
+      return
+    if not strtobool(os.environ.get('DATAGEN_RENAME_ROUTE_FOLDER', '1')):
+      return
+    if self.save_path is None or results is None:
+      return
+
+    results_dict = results.to_json() if hasattr(results, 'to_json') else getattr(results, '__dict__', results)
+    route_id = results_dict.get('route_id')
+    timestamp = results_dict.get('timestamp')
+    if route_id is None or timestamp is None:
+      return
+
+    route_match = re.search(r'route(\d+)', str(timestamp))
+    route_id_match = re.match(r'RouteScenario_(.+)_rep(\d+)$', str(route_id))
+    if route_match is None or route_id_match is None:
+      return
+
+    town = self._get_current_town_name()
+    if town is None:
+      return
+
+    scenario_id = route_id_match.group(1)
+    repetition = route_id_match.group(2)
+    route_index = route_match.group(1)
+    time_suffix = str(timestamp).split(f'route{route_index}_', 1)[-1]
+    target_name = f'{town}_Rep{repetition}_{scenario_id}_route{route_index}_{time_suffix}'
+    target_path = self.save_path.parent / target_name
+    if target_path == self.save_path:
+      return
+
+    target_path = self._deduplicate_route_folder_path(target_path)
+    self.save_path.rename(target_path)
+    print(f'Renamed datagen route folder: {self.save_path} -> {target_path}')
+    self.save_path = target_path
+
+  def _get_current_town_name(self):
+    world = getattr(self, '_world', None)
+    if world is None and self._ego_vehicle is not None:
+      world = self._ego_vehicle.get_world()
+    if world is None:
+      return None
+    try:
+      return world.get_map().name.split('/')[-1]
+    except (RuntimeError, AttributeError):
+      return None
+
+  @staticmethod
+  def _deduplicate_route_folder_path(path):
+    if not path.exists():
+      return path
+
+    for suffix in range(1, 1000):
+      candidate = path.parent / f'{path.name}_dup{suffix}'
+      if not candidate.exists():
+        return candidate
+    raise RuntimeError(f'Could not find free route folder name for {path}')
 
 
 # Filter Functions

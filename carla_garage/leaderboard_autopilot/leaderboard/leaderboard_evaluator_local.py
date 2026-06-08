@@ -267,8 +267,49 @@ class LeaderboardEvaluator(object):
         current_stats_record = self.statistics_manager.compute_route_statistics(
             route_date_string, route_index, self.manager.scenario_duration_system, self.manager.scenario_duration_game, crash_message
         )
+        self._convert_collision_frame_to_agent_step(current_stats_record)
 
         return current_stats_record
+
+    def _convert_collision_frame_to_agent_step(self, current_stats_record):
+        if current_stats_record is None or self.agent_instance is None:
+            return
+
+        meta = getattr(current_stats_record, "meta", None)
+        if not isinstance(meta, dict):
+            return
+
+        collision_global_frame = meta.get("collision_frame")
+        if collision_global_frame is None:
+            return
+
+        agent_step = getattr(self.agent_instance, "step", None)
+        if agent_step is None:
+            return
+
+        try:
+            collision_global_frame = int(collision_global_frame)
+            agent_step = int(agent_step)
+            current_global_frame = int(GameTime.get_frame())
+        except (TypeError, ValueError):
+            return
+
+        route_start_global_frame = current_global_frame - agent_step
+        collision_agent_step = collision_global_frame - route_start_global_frame
+        if collision_agent_step < 0:
+            return
+
+        data_save_freq = getattr(getattr(self.agent_instance, "config", None), "data_save_freq", None)
+        if data_save_freq is None:
+            data_save_freq = os.environ.get("DATA_SAVE_FREQ", 10)
+        try:
+            data_save_freq = max(1, int(data_save_freq))
+        except (TypeError, ValueError):
+            data_save_freq = 10
+
+        meta["collision_global_frame"] = collision_global_frame
+        meta["collision_frame"] = collision_agent_step
+        meta["collision_data_frame"] = collision_agent_step // data_save_freq
 
 
     def _load_and_run_scenario(self, args, config):

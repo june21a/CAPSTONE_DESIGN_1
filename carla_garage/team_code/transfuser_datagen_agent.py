@@ -21,6 +21,7 @@ import ujson
 import transfuser_utils as t_u
 from birds_eye_view.chauffeurnet import ObsManager
 from birds_eye_view.run_stop_sign import RunStopSign
+from nav_planner import extrapolate_waypoint_route
 from sensor_agent import SensorAgent
 
 DEFAULT_EGO_EXTENT = np.array([2.45, 1.06], dtype=np.float32)
@@ -74,6 +75,7 @@ class TransfuserDataAgent(SensorAgent):
     self.gt_bev_manager_augmented = None
     self.gt_stop_sign_criteria = None
     self.augmented_vehicle_dummy = None
+    self.generate_plan_safety_labels = os.environ.get('GENERATE_PLAN_SAFETY_LABELS', '1') == '1'
     self.plan_safety_label_frames = {}
     self.plan_safety_case_label = os.environ.get('SIM_CASE_LABEL', 'transfuser')
     self.plan_safety_unsafe_label = int(os.environ.get('PLAN_SAFETY_UNSAFE_LABEL', 0))
@@ -214,7 +216,11 @@ class TransfuserDataAgent(SensorAgent):
       return
 
     frame = self.step // self.config.data_save_freq
-    route = self._waypoints_to_list(waypoints)
+    plan_safety_route = self._waypoints_to_list(waypoints)
+    route, route_original, next_command = self._route_measurement_from_planner(tick_data, plan_safety_route)
+    target_point = self._tensor_to_list(tick_data.get('target_point'), default=[0.0, 0.0])
+    target_point_next = self._tensor_to_list(tick_data.get('target_point_next'), default=target_point)
+    command = self._command_from_tick(tick_data)
     speed = float(tick_data['speed'].detach().cpu().item())
     target_speed = speed if target_speed is None else float(target_speed)
     ego_matrix = None
@@ -231,13 +237,38 @@ class TransfuserDataAgent(SensorAgent):
         'step': int(self.step),
         'source': 'carla_transfuser',
         'route': route,
+        'route_original': route_original,
+        'changed_route': False,
         'pos_global': ego_location,
         'theta': float(theta),
         'speed': speed,
         'target_speed': target_speed,
         'expert_target_speed': target_speed,
+        'sim_disturbed_target_speed': target_speed,
+        'speed_limit': 0.0,
+        'target_point': target_point,
+        'target_point_next': target_point_next,
+        'command': command,
+        'next_command': next_command,
+        'aim_wp': target_point,
+        'speed_reduced_by_obj_type': None,
+        'speed_reduced_by_obj_id': None,
+        'speed_reduced_by_obj_distance': None,
+        'steer': float(getattr(control, 'steer', 0.0)),
+        'throttle': float(getattr(control, 'throttle', 0.0)),
         'brake': bool(getattr(control, 'brake', 0.0) > 0.05),
-        'angle': float(math.atan2(route[0][1], route[0][0])) if route else 0.0,
+        'control_brake': bool(getattr(control, 'brake', 0.0) > 0.05),
+        'junction': self._ego_vehicle_in_junction(),
+        'vehicle_hazard': False,
+        'vehicle_affecting_id': None,
+        'light_hazard': False,
+        'walker_hazard': False,
+        'walker_affecting_id': None,
+        'stop_sign_hazard': False,
+        'stop_sign_close': False,
+        'walker_close': False,
+        'walker_close_id': None,
+        'angle': float(math.atan2(target_point[1], target_point[0])) if len(target_point) >= 2 else 0.0,
         'augmentation_translation': float(self.augmentation_translation),
         'augmentation_rotation': float(self.augmentation_rotation),
         'ego_matrix': ego_matrix,
@@ -249,7 +280,75 @@ class TransfuserDataAgent(SensorAgent):
     with gzip.open(self.save_path / 'measurements' / f'{frame:04}.json.gz', 'wt', encoding='utf-8') as outfile:
       ujson.dump(measurement, outfile, indent=4)
     self._save_training_sensors(frame, tick_data)
-    self._add_plan_safety_label_candidate(frame, measurement)
+    if self.generate_plan_safety_labels:
+      label_measurement = dict(measurement)
+      label_measurement['route'] = plan_safety_route
+      self._add_plan_safety_label_candidate(frame, label_measurement)
+
+  @staticmethod
+  def _tensor_to_list(value, default=None):
+    if value is None:
+      return list(default) if default is not None else []
+    if hasattr(value, 'detach'):
+      value = value.detach().cpu().numpy()
+    value = np.asarray(value).squeeze()
+    if value.ndim == 0:
+      return [float(value)]
+    return value.astype(float).tolist()
+
+  @staticmethod
+  def _command_from_one_hot(command_one_hot):
+    command = np.asarray(command_one_hot).squeeze()
+    if command.size == 0:
+      return 4
+    return int(np.argmax(command)) + 1
+
+  def _command_from_tick(self, tick_data):
+    command = tick_data.get('command')
+    if command is not None:
+      if hasattr(command, 'detach'):
+        command = command.detach().cpu().numpy()
+      return self._command_from_one_hot(command)
+    if hasattr(self, 'commands') and len(self.commands) > 0:
+      return int(self.commands[-1])
+    return 4
+
+  def _route_measurement_from_planner(self, tick_data, fallback_route=None):
+    fallback_route = fallback_route or []
+    waypoint_planner = getattr(self, '_waypoint_planner', None)
+    if self._ego_vehicle is not None and waypoint_planner is not None:
+      ego_location = self._ego_vehicle.get_transform().location
+      gps = tick_data.get('gps')
+      compass = tick_data.get('compass')
+      if gps is not None:
+        gps = np.asarray(gps, dtype=np.float64)
+        gps = np.append(gps[:2], ego_location.z)
+        waypoint_route = waypoint_planner.run_step(gps)
+        if len(waypoint_route) >= 2:
+          waypoint_nodes = list(extrapolate_waypoint_route(waypoint_route, self.config.num_route_points_saved))
+          if compass is None:
+            compass = np.deg2rad(self._ego_vehicle.get_transform().rotation.yaw)
+          route = [
+              t_u.inverse_conversion_2d(node[0][:2], gps[:2], float(compass)).astype(float).tolist()
+              for node in waypoint_nodes[:self.config.num_route_points_saved]
+          ]
+          if len(waypoint_nodes) > 1:
+            next_command = int(waypoint_nodes[1][1].value)
+          else:
+            next_command = int(waypoint_nodes[0][1].value)
+          return route, route.copy(), next_command
+
+    return fallback_route, fallback_route.copy(), self._command_from_tick(tick_data)
+
+  def _ego_vehicle_in_junction(self):
+    world_map = getattr(self, 'world_map', None)
+    if self._ego_vehicle is None or world_map is None:
+      return False
+    try:
+      waypoint = world_map.get_waypoint(self._ego_vehicle.get_location(), lane_type=carla.LaneType.Any)
+      return bool(waypoint is not None and waypoint.is_junction)
+    except (RuntimeError, AttributeError):
+      return False
 
   def _save_training_sensors(self, frame, tick_data):
     input_data = getattr(self, '_latest_raw_input_data', None)
@@ -1000,7 +1099,10 @@ class TransfuserDataAgent(SensorAgent):
       self._render_trajectory_visualization(frame_key, labeled_frames[frame_key], output_dir)
 
   def _write_plan_safety_labels(self, results=None):
-    if self.save_path is None or not self.datagen or not self.plan_safety_label_frames:
+    if (
+        self.save_path is None or not self.datagen or not self.generate_plan_safety_labels or
+        not self.plan_safety_label_frames
+    ):
       return
 
     route_had_collision = self._results_have_collision(results)
@@ -1073,9 +1175,9 @@ class TransfuserDataAgent(SensorAgent):
         self.delete_route_folder_without_collision and self.save_path is not None and
         not self._results_have_collision(results)
     )
-    route_folder = self.save_path
     self._write_plan_safety_labels(results)
     super().destroy(results)
-    if delete_route_folder and route_folder.exists():
+    route_folder = self.save_path
+    if delete_route_folder and route_folder is not None and route_folder.exists():
       print(f'Deleting route folder without collision event: {route_folder}')
       shutil.rmtree(route_folder)
