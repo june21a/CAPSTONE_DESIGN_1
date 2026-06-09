@@ -393,6 +393,12 @@ def main():
                       type=int,
                       default=int(config.plan_safety_labeled_frames_only),
                       help='For plan_safety mode, train only frames listed in plan_safety_labels.json.gz.')
+  parser.add_argument('--plan_safety_use_planning_features',
+                      '--use_planning_features',
+                      type=int,
+                      dest='plan_safety_use_planning_features',
+                      default=int(config.plan_safety_use_planning_features),
+                      help='Whether the plan_safety head uses planner GRU and target-speed hidden features.')
   parser.add_argument('--plan_safety_loss_weights',
                       type=float,
                       nargs=2,
@@ -457,6 +463,9 @@ def main():
       raise ValueError('--freeze_except_mode_prediction_network requires --use_mode_prediction 1.')
     if config.use_plant:
       raise ValueError('--freeze_except_mode_prediction_network is only supported for sensor models.')
+  if (config.use_mode_prediction and config.mode_prediction_type == 'plan_safety' and
+      config.plan_safety_use_planning_features and not config.use_controller_input_prediction):
+    raise ValueError('--plan_safety_use_planning_features requires --use_controller_input_prediction 1.')
 
   # Before normalizing we need to set the losses we don't use to 0
   if config.use_plant:

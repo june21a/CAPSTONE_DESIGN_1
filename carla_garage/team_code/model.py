@@ -67,7 +67,9 @@ class LidarCenterNet(nn.Module):
         self.mode_head = PlanSafetyModePredictionHead(
             in_channels=self.backbone.num_features,
             hidden_dim=self.config.plan_safety_hidden_dim,
-            dropout=self.config.plan_safety_dropout)
+            dropout=self.config.plan_safety_dropout,
+            use_planning_features=self.config.plan_safety_use_planning_features,
+            planning_feature_dims=self._plan_safety_planning_feature_dims())
       else:
         raise ValueError(f'Unknown mode_prediction_type: {self.config.mode_prediction_type}')
       if self.config.mode_prediction_type == 'plan_safety':
@@ -287,6 +289,17 @@ class LidarCenterNet(nn.Module):
     if self.config.multi_wp_output:
       self.selection_loss = nn.BCEWithLogitsLoss()
 
+  def _plan_safety_planning_feature_dims(self):
+    if not self.config.plan_safety_use_planning_features:
+      return None
+
+    target_speed_input_dim = self.config.gru_input_size if self.config.transformer_decoder_join else \
+      self.config.gru_hidden_size
+    if self.config.input_path_to_target_speed_network:
+      target_speed_input_dim += 2 * self.config.predict_checkpoint_len
+
+    return [self.config.gru_hidden_size, target_speed_input_dim]
+
   def reset_parameters(self):
     if self.config.use_wp_gru:
       nn.init.uniform_(self.wp_query)
@@ -335,6 +348,8 @@ class LidarCenterNet(nn.Module):
     pred_wp_1 = None
     selected_path = None
     mode = None
+    plan_safety_gru_features = None
+    plan_safety_target_speed_features = None
     if self.config.use_mode_prediction and self.config.mode_prediction_type == 'stop_move':
       mode = self.mode_head(fused_features)
 
@@ -379,7 +394,8 @@ class LidarCenterNet(nn.Module):
               joined_wp_features, _ = self.join(self.wp_query.repeat(bs, 1, 1), fused_features)
             else:
               joined_wp_features = self.join(self.wp_query.repeat(bs, 1, 1), fused_features)
-            pred_wp = self.wp_decoder(joined_wp_features, target_point)
+            pred_wp, wp_gru_features = self.wp_decoder(joined_wp_features, target_point, return_final_state=True)
+            plan_safety_gru_features = wp_gru_features
         if self.config.use_controller_input_prediction:
           if self.config.tp_attention:
             tp_token = self.tp_encoder(target_point)
@@ -406,13 +422,16 @@ class LidarCenterNet(nn.Module):
           gru_features = joined_checkpoint_features[:, :self.config.predict_checkpoint_len]
           target_speed_features = joined_checkpoint_features[:, self.config.predict_checkpoint_len]
 
-          pred_checkpoint = self.checkpoint_decoder(gru_features, target_point)
+          pred_checkpoint, checkpoint_gru_features = self.checkpoint_decoder(gru_features,
+                                                                             target_point,
+                                                                             return_final_state=True)
+          plan_safety_gru_features = checkpoint_gru_features
           if self.config.input_path_to_target_speed_network:
             ts_input = torch.cat(
                 (target_speed_features, pred_checkpoint.reshape(bs, self.config.predict_checkpoint_len * 2)), axis=1)
-            pred_target_speed = self.target_speed_network(ts_input)
+            pred_target_speed, plan_safety_target_speed_features = self._predict_target_speed(ts_input)
           else:
-            pred_target_speed = self.target_speed_network(target_speed_features)
+            pred_target_speed, plan_safety_target_speed_features = self._predict_target_speed(target_speed_features)
 
       else:
         joined_features = self.join(fused_features)
@@ -420,18 +439,25 @@ class LidarCenterNet(nn.Module):
         target_speed_features = joined_features[:, :self.config.gru_hidden_size]
 
         if self.config.use_wp_gru:
-          pred_wp = self.wp_decoder(gru_features, target_point)
+          pred_wp, wp_gru_features = self.wp_decoder(gru_features, target_point, return_final_state=True)
+          plan_safety_gru_features = wp_gru_features
         if self.config.use_controller_input_prediction:
-          pred_checkpoint = self.checkpoint_decoder(gru_features, target_point)
+          pred_checkpoint, checkpoint_gru_features = self.checkpoint_decoder(gru_features,
+                                                                             target_point,
+                                                                             return_final_state=True)
+          plan_safety_gru_features = checkpoint_gru_features
           if self.config.input_path_to_target_speed_network:
             ts_input = torch.cat(
                 (target_speed_features, pred_checkpoint.reshape(bs, self.config.predict_checkpoint_len * 2)), axis=1)
-            pred_target_speed = self.target_speed_network(ts_input)
+            pred_target_speed, plan_safety_target_speed_features = self._predict_target_speed(ts_input)
           else:
-            pred_target_speed = self.target_speed_network(target_speed_features)
+            pred_target_speed, plan_safety_target_speed_features = self._predict_target_speed(target_speed_features)
 
     if self.config.use_mode_prediction and self.config.mode_prediction_type == 'plan_safety':
-      mode = self.mode_head(mode_scene_features)
+      planning_features = None
+      if self.config.plan_safety_use_planning_features:
+        planning_features = [plan_safety_gru_features, plan_safety_target_speed_features]
+      mode = self.mode_head(mode_scene_features, planning_features=planning_features)
 
     # Auxiliary tasks
     pred_semantic = None
@@ -460,6 +486,14 @@ class LidarCenterNet(nn.Module):
 
     return pred_wp, pred_target_speed, pred_checkpoint, pred_semantic, pred_bev_semantic, pred_depth, \
       pred_bounding_box, attention_weights, pred_wp_1, selected_path, mode
+
+  def _predict_target_speed(self, target_speed_input):
+    target_speed_features = target_speed_input
+    for layer in self.target_speed_network[:-1]:
+      target_speed_features = layer(target_speed_features)
+
+    pred_target_speed = self.target_speed_network[-1](target_speed_features)
+    return pred_target_speed, target_speed_features
 
   def compute_loss(self, pred_wp, pred_target_speed, pred_checkpoint, pred_semantic, pred_bev_semantic, pred_depth,
                    pred_bounding_box, pred_wp_1, selected_path, waypoint_label, target_speed_label, checkpoint_label,
@@ -1006,16 +1040,18 @@ class GRUWaypointsPredictorInterFuser(nn.Module):
     self.decoder = nn.Linear(hidden_size, 2)
     self.waypoints = waypoints
 
-  def forward(self, x, target_point):
+  def forward(self, x, target_point, return_final_state=False):
     bs = x.shape[0]
     if self.target_point_size > 0:
       z = self.encoder(target_point).unsqueeze(0)
     else:
       z = torch.zeros((1, bs, self.hidden_size), device=x.device)
-    output, _ = self.gru(x, z)
+    output, final_state = self.gru(x, z)
     output = output.reshape(bs * self.waypoints, -1)
     output = self.decoder(output).reshape(bs, self.waypoints, 2)
     output = torch.cumsum(output, 1)
+    if return_final_state:
+      return output, final_state.squeeze(0)
     return output
 
 
@@ -1034,7 +1070,7 @@ class GRUWaypointsPredictorTransFuser(nn.Module):
     self.config = config
     self.prediction_len = pred_len
 
-  def forward(self, z, target_point):
+  def forward(self, z, target_point, return_final_state=False):
     output_wp = []
 
     # initial input variable to GRU
@@ -1061,6 +1097,9 @@ class GRUWaypointsPredictorTransFuser(nn.Module):
       output_wp.append(x)
 
     pred_wp = torch.stack(output_wp, dim=1)
+
+    if return_final_state:
+      return pred_wp, z
 
     return pred_wp
 
@@ -1147,10 +1186,11 @@ class ModePredictionHead(nn.Module):
 
 class PlanSafetyModePredictionHead(nn.Module):
   """
-  Scene-only plan safety mode head.
+  Plan safety mode head.
 
   Inputs:
     fused_feature:       (B, C, H, W) or (B, C), from the perception backbone
+    planning_features:   optional list of (B, D) planning vectors
   Output:
     mode_logits:         (B, 2), class 0=unsafe/will_collide, 1=safe
     mode_prob:           (B, 2)
@@ -1159,11 +1199,26 @@ class PlanSafetyModePredictionHead(nn.Module):
   def __init__(self,
                in_channels,
                hidden_dim=256,
-               dropout=0.1):
+               dropout=0.1,
+               use_planning_features=False,
+               planning_feature_dims=None):
     super().__init__()
+    self.use_planning_features = use_planning_features
     self.gap = nn.AdaptiveAvgPool2d((1, 1))
+    if self.use_planning_features:
+      if not planning_feature_dims:
+        raise ValueError('planning_feature_dims must be provided when use_planning_features is enabled.')
+      self.planning_feature_projections = nn.ModuleList([
+          nn.Sequential(nn.Linear(feature_dim, hidden_dim), nn.ReLU(inplace=True))
+          for feature_dim in planning_feature_dims
+      ])
+      classifier_input_dim = in_channels + hidden_dim * len(planning_feature_dims)
+    else:
+      self.planning_feature_projections = nn.ModuleList()
+      classifier_input_dim = in_channels
+
     self.classifier = nn.Sequential(
-        nn.Linear(in_channels, hidden_dim),
+        nn.Linear(classifier_input_dim, hidden_dim),
         nn.ReLU(inplace=True),
         nn.Dropout(dropout),
         nn.Linear(hidden_dim, hidden_dim),
@@ -1172,7 +1227,7 @@ class PlanSafetyModePredictionHead(nn.Module):
         nn.Linear(hidden_dim, 2),
     )
 
-  def forward(self, fused_feature):
+  def forward(self, fused_feature, planning_features=None):
     if fused_feature.ndim == 4:
       x = self.gap(fused_feature)
       x = torch.flatten(x, 1)
@@ -1180,6 +1235,20 @@ class PlanSafetyModePredictionHead(nn.Module):
       x = fused_feature
     else:
       raise ValueError(f'PlanSafetyModePredictionHead expects 2D or 4D features, got {fused_feature.shape}')
+
+    if self.use_planning_features:
+      if planning_features is None:
+        raise ValueError('PlanSafetyModePredictionHead requires planning_features when use_planning_features is enabled.')
+      if len(planning_features) != len(self.planning_feature_projections):
+        raise ValueError(f'Expected {len(self.planning_feature_projections)} planning features, '
+                         f'got {len(planning_features)}.')
+
+      projected_planning_features = []
+      for planning_feature, projection in zip(planning_features, self.planning_feature_projections):
+        if planning_feature is None:
+          raise ValueError('Missing planning feature for PlanSafetyModePredictionHead.')
+        projected_planning_features.append(projection(planning_feature))
+      x = torch.cat([x, *projected_planning_features], dim=1)
 
     mode_logits = self.classifier(x)
     mode_prob = F.softmax(mode_logits, dim=1)

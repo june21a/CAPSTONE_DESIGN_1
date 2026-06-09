@@ -1223,71 +1223,43 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
     return interpolated_route_points
 
   def iterative_line_interpolation(self, route):
-    interpolated_route_points = []
+    route = np.asarray(route, dtype=np.float32)
+    if route.shape[0] == 0:
+      return np.zeros((self.config.num_route_points, 2), dtype=np.float32)
 
-    # this value is actually not used anymore, it is overwritten in the loop
-    min_distance = self.config.dense_route_planner_min_distance
     target_first_distance = 2.5
-    last_interpolated_point = np.array([0.0, 0.0])
-    current_route_index = 0
-    current_point = route[current_route_index]
-    last_point = np.array([0.0, 0.0])
-    first_iteration = True
+    target_distances = target_first_distance + np.arange(self.config.num_route_points, dtype=np.float32)
 
-    while len(interpolated_route_points) < self.config.num_route_points:
-      # First point should be target_first_distance away from the vehicle.
-      if not first_iteration:
-        current_route_index += 1
-        last_point = current_point
+    path = np.vstack((np.zeros((1, 2), dtype=np.float32), route))
+    segment_vectors = np.diff(path, axis=0)
+    segment_lengths = np.linalg.norm(segment_vectors, axis=1)
+    valid_segments = segment_lengths > 1e-6
 
-      if current_route_index < route.shape[0]:
-        current_point = route[current_route_index]
-        intersection = t_u.circle_line_segment_intersection(
-            circle_center=last_interpolated_point,
-            circle_radius=min_distance if not first_iteration else target_first_distance,
-            pt1=last_interpolated_point,
-            pt2=current_point,
-            full_line=True)
+    if not np.any(valid_segments):
+      return np.tile(route[-1], (self.config.num_route_points, 1))
 
-      else:  # We hit the end of the input route. We extrapolate the last 2 points
-        current_point = route[-1]
-        last_point = route[-2]
-        intersection = t_u.circle_line_segment_intersection(circle_center=last_interpolated_point,
-                                                            circle_radius=min_distance,
-                                                            pt1=last_point,
-                                                            pt2=current_point,
-                                                            full_line=True)
+    path = np.vstack((path[:1], path[1:][valid_segments]))
+    segment_vectors = np.diff(path, axis=0)
+    segment_lengths = np.linalg.norm(segment_vectors, axis=1)
+    cumulative_lengths = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+    total_length = cumulative_lengths[-1]
 
-      # 3 cases: 0 intersection, 1 intersection, 2 intersection
-      if len(intersection) > 1:  # 2 intersections
-        # Take the one that is closer to current point
-        point_1 = np.array(intersection[0])
-        point_2 = np.array(intersection[1])
-        direction = current_point - last_point
-        dot_p1_to_last = np.dot(point_1, direction)
-        dot_p2_to_last = np.dot(point_2, direction)
+    interpolated_route_points = []
+    for target_distance in target_distances:
+      if target_distance <= total_length:
+        segment_index = np.searchsorted(cumulative_lengths, target_distance, side='right') - 1
+        segment_index = min(segment_index, segment_lengths.shape[0] - 1)
+        segment_start_distance = cumulative_lengths[segment_index]
+        segment_fraction = (target_distance - segment_start_distance) / segment_lengths[segment_index]
+        interpolated_point = path[segment_index] + segment_fraction * segment_vectors[segment_index]
+      else:
+        extrapolated_distance = target_distance - total_length
+        final_direction = segment_vectors[-1] / segment_lengths[-1]
+        interpolated_point = path[-1] + extrapolated_distance * final_direction
 
-        if dot_p1_to_last > dot_p2_to_last:
-          intersection_point = point_1
-        else:
-          intersection_point = point_2
-        add_point = True
-      elif len(intersection) == 1:  # 1 Intersections
-        intersection_point = np.array(intersection[0])
-        add_point = True
-      else:  # 0 Intersection
-        add_point = False
-        raise Exception("No intersection found. This should never occur.")
+      interpolated_route_points.append(interpolated_point)
 
-      if add_point:
-        last_interpolated_point = intersection_point
-        interpolated_route_points.append(intersection_point)
-        min_distance = 1.0  # After the first point we want each point to be 1 m away from the last.
-
-      first_iteration = False
-
-    interpolated_route_points = np.array(interpolated_route_points)
-    return interpolated_route_points
+    return np.asarray(interpolated_route_points, dtype=np.float32)
 
 
 def image_augmenter(prob=0.2, cutout=False):

@@ -834,6 +834,7 @@ class GlobalConfig:
     self.mode_stop_threshold = 0.5
     self.plan_safety_hidden_dim = 256
     self.plan_safety_dropout = 0.1
+    self.plan_safety_use_planning_features = False
     self.plan_safety_labeled_frames_only = False
     self.plan_safety_loss_weights = [5.0, 1.0]
 
