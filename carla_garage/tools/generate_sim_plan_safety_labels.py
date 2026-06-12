@@ -593,6 +593,8 @@ def evaluate_collision_reachability(
         "time_to_collision": None,
         "intersects_future_collision_region": False,
         "reachable_before_collision": False,
+        "unsafe_requires_non_straight_waypoints": True,
+        "suppressed_unsafe_straight_waypoint_rollout": False,
         "distance_to_collision_region_along_rollout": None,
         "reachable_distance_before_collision": None,
     }
@@ -635,8 +637,12 @@ def evaluate_collision_reachability(
     detail["distance_to_collision_region_along_rollout"] = round(distance_to_region, 4)
     detail["reachable_distance_before_collision"] = round(reachable_distance, 4)
     detail["reachable_before_collision"] = reachable_distance >= distance_to_region
-    detail["collision_case_unsafe"] = bool(detail["reachable_before_collision"])
-    return bool(detail["reachable_before_collision"]), detail
+    unsafe = bool(detail["reachable_before_collision"] and not straight_rollout)
+    detail["collision_case_unsafe"] = unsafe
+    detail["suppressed_unsafe_straight_waypoint_rollout"] = bool(
+        detail["reachable_before_collision"] and straight_rollout
+    )
+    return unsafe, detail
 
 
 def evaluate_collision_events_reachability(
@@ -1313,7 +1319,8 @@ def label_route(
         "collision_event_count": len(resolved_collision_events),
         "collision_case_unsafe_criterion": (
             "within_10_frames_before_each_collision_event_and_up_to_future_collision_frame_window_"
-            "future_collision_region_ego_box_overlap_and_velocity_rollout_reachability"
+            "future_collision_region_ego_box_overlap_and_velocity_rollout_reachability_"
+            "and_non_straight_waypoint_rollout"
         ),
         "max_checked_frames_before_event": MAX_CHECKED_FRAMES_BEFORE_EVENT,
         "collision_frame_future_window": collision_frame_future_window,
@@ -1392,7 +1399,7 @@ def main() -> int:
     parser.add_argument(
         "--collision-region-radius",
         type=float,
-        default=0.5,
+        default=0.25,
         help=(
             "Optional radius in meters around the future collision pose treated as the collision region. "
             "Defaults to the ego_car extent from dataset boxes, falling back to the built-in ego extent."

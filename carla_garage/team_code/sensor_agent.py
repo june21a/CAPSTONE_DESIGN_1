@@ -1029,8 +1029,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
           current_game_time = float(timestamp) if timestamp is not None else self.step * self.config.carla_frame_rate
           can_activate_stop_mode = current_game_time >= self.stop_mode_cooldown_until
           if stop_mode_active and can_activate_stop_mode:
-            self.stop_mode_zero_until = current_game_time + 0.5  # 10frame
-            self.stop_mode_cooldown_until = self.stop_mode_zero_until + 3.0 # 60frame
+            self.stop_mode_zero_until = current_game_time + 0.3  # 6frame
+            self.stop_mode_cooldown_until = self.stop_mode_zero_until # 60frame
 
           if self.stop_mode_zero_until is not None and current_game_time < self.stop_mode_zero_until:
             pred_target_speed_scalar = self.inference_target_speeds[0]

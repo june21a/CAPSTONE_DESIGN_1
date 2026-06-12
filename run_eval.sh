@@ -13,13 +13,13 @@ export PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${SCENARIO_RUNNER_ROOT}:${LEADE
 
 # ===== Path Settings =====
 CARLA_GARAGE_DIR="${CURRENT_DIR}/carla_garage"
-AGENT_CONFIG="/home/ec2-user/AD_challenge/experiments/pretrained_plan_safety_2"
+AGENT_CONFIG="/home/ec2-user/AD_challenge/experiments/pretrained_plan_safety_use_planning_features_final_data_1"
 AGENT="./team_code/comparison_agent.py"
-ROUTES="./leaderboard/data/bench2drive220_test_sample_55.xml"
-SAVE_PATH_DIR="./results/pretrained_plan_safety_2_heuristic_b2d55"
+ROUTES="./leaderboard/data/hard_example_b2d55.xml"
+SAVE_PATH_DIR="./results/pretrained_plan_safety_use_planning_features_final_data_1_b2d55_only_failure"
 CHECKPOINT="${SAVE_PATH_DIR}/debug_results.json"
 RESUME=1
-USE_HEURISTIC=1
+USE_HEURISTIC=0
 
 # ===== Environment Variables =====
 export DEBUG_CHALLENGE=1
