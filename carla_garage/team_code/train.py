@@ -77,7 +77,12 @@ def main():
                       '13_withheld: Do not train on Town 13. '
                       '12_only: Only trains with data from Town 12 '
                       'Withheld data is used for validation')
-  parser.add_argument('--root_dir', type=str, required=True, nargs='+', help='Root directory of your training data')
+  default_new_training_data = str(pathlib.Path(__file__).resolve().parents[1] / 'new_training_data')
+  parser.add_argument('--root_dir',
+                      type=str,
+                      default=[default_new_training_data],
+                      nargs='+',
+                      help='Root directory of your training data')
   parser.add_argument('--schedule_reduce_epoch_01',
                       type=int,
                       default=config.schedule_reduce_epoch_01,
@@ -382,7 +387,7 @@ def main():
                       help='Whether to train and run a mode prediction head.')
   parser.add_argument('--mode_prediction_type',
                       type=str,
-                      choices=('stop_move', 'plan_safety'),
+                      choices=('stop_move', 'plan_safety', 'plan_safety_dynamic'),
                       default=str(config.mode_prediction_type),
                       help='Mode prediction head type. stop_move keeps the original head; plan_safety judges plans.')
   parser.add_argument('--mode_stop_threshold',
@@ -404,6 +409,30 @@ def main():
                       nargs=2,
                       default=config.plan_safety_loss_weights,
                       help='Class weights [unsafe, safe] for plan_safety mode focal loss.')
+  parser.add_argument('--plan_safety_vit_dim',
+                      type=int,
+                      default=int(config.plan_safety_vit_dim),
+                      help='Token width for the dynamic plan-safety BEV/ego transformers.')
+  parser.add_argument('--plan_safety_vit_patch_size',
+                      type=int,
+                      default=int(config.plan_safety_vit_patch_size),
+                      help='Patch size for the dynamic plan-safety BEV ViT encoder.')
+  parser.add_argument('--plan_safety_vit_layers',
+                      type=int,
+                      default=int(config.plan_safety_vit_layers),
+                      help='Number of BEV transformer encoder layers for dynamic plan safety.')
+  parser.add_argument('--plan_safety_vit_heads',
+                      type=int,
+                      default=int(config.plan_safety_vit_heads),
+                      help='Number of attention heads for dynamic plan safety.')
+  parser.add_argument('--plan_safety_ego_layers',
+                      type=int,
+                      default=int(config.plan_safety_ego_layers),
+                      help='Number of ego-rollout transformer encoder layers for dynamic plan safety.')
+  parser.add_argument('--plan_safety_bev_history_stride',
+                      type=int,
+                      default=int(config.plan_safety_bev_history_stride),
+                      help='Evaluation-frame stride between BEV(t) and BEV(t-1) for dynamic plan safety.')
 
   args = parser.parse_args()
   args.logdir = os.path.join(args.logdir, args.id)
@@ -806,7 +835,7 @@ class Engine(object):
     self.detailed_loss_weights = config.detailed_loss_weights
 
   def _mode_prediction_class_names(self):
-    if self.config.mode_prediction_type == 'plan_safety':
+    if self.config.mode_prediction_type in ('plan_safety', 'plan_safety_dynamic'):
       return ('unsafe', 'safe')
     return ('stop', 'move')
 
@@ -929,6 +958,12 @@ class Engine(object):
         lidar = data['temporal_lidar'].to(self.device, dtype=torch.float32)
       else:
         lidar = data['lidar'].to(self.device, dtype=torch.float32)
+      if self.config.use_mode_prediction and self.config.mode_prediction_type == 'plan_safety_dynamic':
+        plan_safety_lidar = data['plan_safety_lidar'].to(self.device, dtype=torch.float32)
+        plan_safety_target_speed = data['target_speed_scalar'].to(self.device, dtype=torch.float32)
+      else:
+        plan_safety_lidar = None
+        plan_safety_target_speed = None
 
       pred_wp,\
       pred_target_speed,\
@@ -944,7 +979,9 @@ class Engine(object):
                           target_point=target_point,
                           ego_vel=ego_vel,
                           command=command,
-                          target_point_next=target_point_next if self.config.two_tp_input else None)
+                          target_point_next=target_point_next if self.config.two_tp_input else None,
+                          plan_safety_lidar_bev=plan_safety_lidar,
+                          plan_safety_target_speed=plan_safety_target_speed)
     else:
       raise ValueError('The chosen vision backbone does not exist. The options are: transFuser, aim, bev_encoder')
 

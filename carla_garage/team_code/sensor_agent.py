@@ -208,10 +208,12 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     # Used to set the filter state equal the first measurement
     self.filter_initialized = False
     # Stores the last filtered positions of the ego vehicle. Need at least 2 for LiDAR 10 Hz realignment
-    self.state_log = deque(maxlen=max((self.config.lidar_seq_len * self.config.data_save_freq), 2))
+    plan_safety_history = int(getattr(self.config, 'plan_safety_bev_history_stride', self.config.data_save_freq)) + 1 \
+        if getattr(self.config, 'mode_prediction_type', '') == 'plan_safety_dynamic' else 2
+    self.state_log = deque(maxlen=max((self.config.lidar_seq_len * self.config.data_save_freq), plan_safety_history, 2))
 
     #Temporal LiDAR
-    self.lidar_buffer = deque(maxlen=self.config.lidar_seq_len * self.config.data_save_freq)
+    self.lidar_buffer = deque(maxlen=max(self.config.lidar_seq_len * self.config.data_save_freq, plan_safety_history))
 
     self.lidar_last = None
 
@@ -430,8 +432,42 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     overlay = np.rot90(overlay, k=1)
     return np.ascontiguousarray(lidar_image, dtype=np.uint8), np.ascontiguousarray(overlay, dtype=np.uint8)
 
+  def _mode_prediction_class_names(self):
+    if self.config.mode_prediction_type in ('plan_safety', 'plan_safety_dynamic'):
+      return ('unsafe', 'safe')
+    return ('stop', 'move')
+
+  def _serialize_mode_prediction(self, pred_mode_ensemble, pred_mode_logits_ensemble):
+    if pred_mode_ensemble is None:
+      return None
+
+    mode_prob = pred_mode_ensemble.detach().float().cpu().numpy()
+    mode_logits = None
+    if pred_mode_logits_ensemble is not None:
+      mode_logits = pred_mode_logits_ensemble.detach().float().cpu().numpy()
+
+    class_names = self._mode_prediction_class_names()
+    predicted_class = int(np.argmax(mode_prob))
+    result = {
+        'type': self.config.mode_prediction_type,
+        'class_names': list(class_names),
+        'probabilities': mode_prob.tolist(),
+        'predicted_class': predicted_class,
+        'predicted_label': class_names[predicted_class] if predicted_class < len(class_names) else str(predicted_class),
+        'threshold': float(getattr(self.config, 'mode_stop_threshold', 0.5)),
+    }
+    if mode_logits is not None:
+      result['logits'] = mode_logits.tolist()
+    if self.config.mode_prediction_type in ('plan_safety', 'plan_safety_dynamic') and mode_prob.shape[0] >= 2:
+      result['unsafe_probability'] = float(mode_prob[0])
+      result['safe_probability'] = float(mode_prob[1])
+    elif mode_prob.shape[0] >= 2:
+      result['stop_probability'] = float(mode_prob[0])
+      result['move_probability'] = float(mode_prob[1])
+    return result
+
   def _save_sensor_attention_data(self, tick_data, lidar_bev, rgb_attention_map, lidar_attention_map, control,
-                                  pred_target_speed_scalar):
+                                  pred_target_speed_scalar, pred_mode_ensemble=None, pred_mode_logits_ensemble=None):
     if self.save_path is None or not self.collect_sensor_data or self.step % self.attention_save_freq != 0:
       return
 
@@ -443,7 +479,9 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     lidar_attention_map_path = sensor_path / 'lidar_attention'
     lidar_attention_path = sensor_path / 'lidar_attention_overlay'
     metadata_path = sensor_path / 'metadata'
-    for path in (rgb_path, lidar_path, attention_path, overlay_path, lidar_attention_map_path, lidar_attention_path, metadata_path):
+    mode_prediction_path = sensor_path / 'mode_prediction'
+    for path in (rgb_path, lidar_path, attention_path, overlay_path, lidar_attention_map_path, lidar_attention_path,
+                 metadata_path, mode_prediction_path):
       path.mkdir(parents=True, exist_ok=True)
 
     frame_id = f'{self.step:04}'
@@ -476,11 +514,13 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       cv2.imwrite(str(lidar_attention_path / f'{frame_id}.png'), lidar_attention_overlay)
 
 
+    mode_prediction = self._serialize_mode_prediction(pred_mode_ensemble, pred_mode_logits_ensemble)
     metadata = {
         'step': self.step,
         'speed': float(tick_data['speed'].detach().cpu().item()),
         'target_point': tick_data['target_point'].detach().cpu().numpy()[0].tolist(),
         'pred_target_speed_scalar': None if pred_target_speed_scalar is None else float(pred_target_speed_scalar),
+        'mode_prediction': mode_prediction,
         'control': {
             'steer': float(control.steer),
             'throttle': float(control.throttle),
@@ -489,6 +529,9 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     }
     with open(metadata_path / f'{frame_id}.json', 'w', encoding='utf-8') as outfile:
       ujson.dump(metadata, outfile, indent=2)
+    if mode_prediction is not None:
+      with open(mode_prediction_path / f'{frame_id}.json', 'w', encoding='utf-8') as outfile:
+        ujson.dump(mode_prediction, outfile, indent=2)
 
   def _save_vision_task_data(self, tick_data, lidar_bev, pred_semantic, pred_bev_semantic, pred_depth, pred_bb):
     if self.save_path is None or not self.collect_sensor_data:
@@ -911,6 +954,26 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     if self.config.backbone not in ('aim'):
       self.lidar_last = deepcopy(tick_data['lidar'])
 
+    plan_safety_lidar_bev = None
+    if self.config.use_mode_prediction and self.config.mode_prediction_type == 'plan_safety_dynamic':
+      history_stride = max(1, int(getattr(self.config, 'plan_safety_bev_history_stride', self.config.data_save_freq)))
+      current_lidar_point_cloud = deepcopy(self.lidar_buffer[-1])
+      prev_lidar_point_cloud = current_lidar_point_cloud
+      if len(self.lidar_buffer) > history_stride and len(self.state_log) > history_stride:
+        prev_lidar_point_cloud = deepcopy(self.lidar_buffer[-(history_stride + 1)])
+        prev_x = self.state_log[-(history_stride + 1)][0]
+        prev_y = self.state_log[-(history_stride + 1)][1]
+        prev_theta = self.state_log[-(history_stride + 1)][2]
+        prev_lidar_point_cloud = self.align_lidar(prev_lidar_point_cloud, prev_x, prev_y, prev_theta, ego_x, ego_y,
+                                                  ego_theta)
+
+      prev_lidar_histogram = self.data.lidar_to_histogram_features(prev_lidar_point_cloud,
+                                                                   use_ground_plane=self.config.use_ground_plane)
+      current_lidar_histogram = self.data.lidar_to_histogram_features(current_lidar_point_cloud,
+                                                                      use_ground_plane=self.config.use_ground_plane)
+      plan_safety_lidar_bev = torch.from_numpy(np.concatenate((prev_lidar_histogram, current_lidar_histogram), axis=0))
+      plan_safety_lidar_bev = plan_safety_lidar_bev.unsqueeze(0).to(self.device, dtype=torch.float32)
+
     # prepare velocity(ego vehicle) input
     gt_velocity = tick_data['speed']
     velocity = gt_velocity.reshape(1, 1)  # used by transfuser
@@ -929,6 +992,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     pred_target_speeds = []
     pred_checkpoints = []
     pred_modes = []
+    pred_mode_logits = []
     bounding_boxes = []
     wp_selected = None
     rgb_attention_maps = []
@@ -951,7 +1015,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
           target_point=tick_data['target_point'],
           target_point_next=tick_data['target_point_next'] if self.config.two_tp_input else None,
           ego_vel=velocity,
-          command=tick_data['command'])
+          command=tick_data['command'],
+          plan_safety_lidar_bev=plan_safety_lidar_bev)
         latest_rgb_attention_map = getattr(self.nets[i], 'latest_rgb_attention_map', None)
         if latest_rgb_attention_map is not None:
           rgb_attention_maps.append(latest_rgb_attention_map)
@@ -981,7 +1046,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         pred_target_speeds.append(F.softmax(pred_target_speed[0], dim=0))
         pred_checkpoints.append(pred_checkpoint[0])
       if self.config.use_mode_prediction:
-        _, pred_mode_prob = pred_mode
+        pred_mode_logit, pred_mode_prob = pred_mode
+        pred_mode_logits.append(pred_mode_logit[0])
         pred_modes.append(pred_mode_prob[0])
 
       bounding_boxes.append(pred_bounding_box)
@@ -1007,6 +1073,12 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     # calculate target speed scalar from model predictions
     pred_mode_ensemble = None
+    pred_mode_logits_ensemble = None
+    if self.config.use_mode_prediction and len(pred_modes) > 0:
+      pred_mode_ensemble = torch.stack(pred_modes, dim=0).mean(dim=0)
+      if len(pred_mode_logits) > 0:
+        pred_mode_logits_ensemble = torch.stack(pred_mode_logits, dim=0).mean(dim=0)
+
     if self.config.use_controller_input_prediction:
       pred_target_speed_ensemble = torch.stack(pred_target_speeds,
                                                dim=0).mean(dim=0)  # average across ensemble models' prediction
@@ -1020,23 +1092,22 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       else:
         pred_target_speed_index = torch.argmax(pred_target_speed_ensemble)
         pred_target_speed_scalar = self.inference_target_speeds[pred_target_speed_index]
-      if self.config.use_mode_prediction and len(pred_modes) > 0:
-        pred_mode_ensemble = torch.stack(pred_modes, dim=0).mean(dim=0)
-        stop_threshold = getattr(self.config, 'mode_stop_threshold', 0.5)
+      # if pred_mode_ensemble is not None:
+      #   stop_threshold = getattr(self.config, 'mode_stop_threshold', 0.5)
         
-        if use_heuristic:
-          stop_mode_active = pred_mode_ensemble[0].item() >= stop_threshold
-          current_game_time = float(timestamp) if timestamp is not None else self.step * self.config.carla_frame_rate
-          can_activate_stop_mode = current_game_time >= self.stop_mode_cooldown_until
-          if stop_mode_active and can_activate_stop_mode:
-            self.stop_mode_zero_until = current_game_time + 0.3  # 6frame
-            self.stop_mode_cooldown_until = self.stop_mode_zero_until # 60frame
+      #   if use_heuristic:
+      #     stop_mode_active = pred_mode_ensemble[0].item() >= stop_threshold
+      #     current_game_time = float(timestamp) if timestamp is not None else self.step * self.config.carla_frame_rate
+      #     can_activate_stop_mode = current_game_time >= self.stop_mode_cooldown_until
+      #     if stop_mode_active and can_activate_stop_mode:
+      #       self.stop_mode_zero_until = current_game_time + 1.5  # 6frame
+      #       self.stop_mode_cooldown_until = self.stop_mode_zero_until + 3.0 # 60frame
 
-          if self.stop_mode_zero_until is not None and current_game_time < self.stop_mode_zero_until:
-            pred_target_speed_scalar = self.inference_target_speeds[0]
-        else:
-          if pred_mode_ensemble[0].item() >= stop_threshold:
-            pred_target_speed_scalar = self.inference_target_speeds[0]
+      #     if self.stop_mode_zero_until is not None and current_game_time < self.stop_mode_zero_until:
+      #       pred_target_speed_scalar = self.inference_target_speeds[0]
+      #   else:
+      #     if pred_mode_ensemble[0].item() >= stop_threshold:
+      #       pred_target_speed_scalar = self.inference_target_speeds[0]
         
     else:
       pred_target_speed_scalar = None
@@ -1157,7 +1228,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         control,
         pred_waypoints=plan_safety_waypoints)
     self._save_sensor_attention_data(tick_data, lidar_bev, rgb_attention_map, lidar_attention_map, control,
-                                     pred_target_speed_scalar)
+                                     pred_target_speed_scalar, pred_mode_ensemble, pred_mode_logits_ensemble)
     self._save_vision_task_data(tick_data, lidar_bev, pred_semantic, pred_bev_semantic, pred_depth,
                                 bbs_vehicle_coordinate_system)
 

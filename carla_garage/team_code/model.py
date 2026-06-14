@@ -70,9 +70,20 @@ class LidarCenterNet(nn.Module):
             dropout=self.config.plan_safety_dropout,
             use_planning_features=self.config.plan_safety_use_planning_features,
             planning_feature_dims=self._plan_safety_planning_feature_dims())
+      elif self.config.mode_prediction_type == 'plan_safety_dynamic':
+        self.mode_head = DynamicPlanSafetyModePredictionHead(
+            fused_channels=self.backbone.num_features,
+            lidar_channels=1 + int(self.config.use_ground_plane),
+            hidden_dim=self.config.plan_safety_hidden_dim,
+            vit_dim=self.config.plan_safety_vit_dim,
+            patch_size=self.config.plan_safety_vit_patch_size,
+            num_vit_layers=self.config.plan_safety_vit_layers,
+            num_ego_layers=self.config.plan_safety_ego_layers,
+            num_heads=self.config.plan_safety_vit_heads,
+            dropout=self.config.plan_safety_dropout)
       else:
         raise ValueError(f'Unknown mode_prediction_type: {self.config.mode_prediction_type}')
-      if self.config.mode_prediction_type == 'plan_safety':
+      if self.config.mode_prediction_type in ('plan_safety', 'plan_safety_dynamic'):
         mode_loss_weights = torch.tensor(self.config.plan_safety_loss_weights, dtype=torch.float32)
         self.loss_mode = FocalLoss(alpha=mode_loss_weights, gamma=self.config.focal_loss_gamma)
       else:
@@ -322,7 +333,9 @@ class LidarCenterNet(nn.Module):
               target_point,
               ego_vel,
               command,
-              target_point_next=None):
+              target_point_next=None,
+              plan_safety_lidar_bev=None,
+              plan_safety_target_speed=None):
     bs = rgb.shape[0]
     self.latest_attention_map = None
     self.latest_rgb_attention_map = None
@@ -458,6 +471,22 @@ class LidarCenterNet(nn.Module):
       if self.config.plan_safety_use_planning_features:
         planning_features = [plan_safety_gru_features, plan_safety_target_speed_features]
       mode = self.mode_head(mode_scene_features, planning_features=planning_features)
+    elif self.config.use_mode_prediction and self.config.mode_prediction_type == 'plan_safety_dynamic':
+      plan_waypoints = pred_checkpoint if pred_checkpoint is not None else pred_wp
+      if plan_safety_target_speed is None and pred_target_speed is not None:
+        target_speeds = torch.tensor(self.config.target_speeds, dtype=pred_target_speed.dtype, device=pred_target_speed.device)
+        plan_safety_target_speed = torch.sum(F.softmax(pred_target_speed, dim=1) * target_speeds.unsqueeze(0), dim=1)
+      if plan_safety_target_speed is None:
+        plan_safety_target_speed = ego_vel.squeeze(1)
+      mode = self.mode_head(
+          fused_feature=mode_scene_features,
+          plan_safety_lidar_bev=plan_safety_lidar_bev,
+          waypoints=plan_waypoints,
+          target_speed=plan_safety_target_speed,
+          ego_speed=ego_vel,
+          rollout_dt=self.config.plan_safety_rollout_dt,
+          max_acceleration=self.config.plan_safety_max_acceleration,
+          max_deceleration=self.config.plan_safety_max_deceleration)
 
     # Auxiliary tasks
     pred_semantic = None
@@ -977,7 +1006,7 @@ class LidarCenterNet(nn.Module):
 
       if pred_mode.size >= 2:
         mode_idx = int(np.argmax(pred_mode[:2]))
-        if self.config.mode_prediction_type == 'plan_safety':
+        if self.config.mode_prediction_type in ('plan_safety', 'plan_safety_dynamic'):
           unsafe_prob = float(pred_mode[0])
           safe_prob = float(pred_mode[1])
           mode_text = 'UNSAFE' if mode_idx == 0 else 'SAFE'
@@ -996,7 +1025,7 @@ class LidarCenterNet(nn.Module):
                     cv2.LINE_AA)
       else:
         mode_idx = int(round(float(pred_mode.item())))
-        if self.config.mode_prediction_type == 'plan_safety':
+        if self.config.mode_prediction_type in ('plan_safety', 'plan_safety_dynamic'):
           mode_text = 'UNSAFE' if mode_idx == 0 else 'SAFE'
           mode_color = (255, 0, 0) if mode_idx == 0 else (0, 160, 0)
         else:
@@ -1251,6 +1280,168 @@ class PlanSafetyModePredictionHead(nn.Module):
       x = torch.cat([x, *projected_planning_features], dim=1)
 
     mode_logits = self.classifier(x)
+    mode_prob = F.softmax(mode_logits, dim=1)
+
+    return mode_logits, mode_prob
+
+
+class DynamicPlanSafetyModePredictionHead(nn.Module):
+  """
+  Motion-aware plan safety head.
+
+  Inputs:
+    fused_feature:              (B, C, H, W) or (B, C), from TransFuser
+    plan_safety_lidar_bev:      (B, 2*C_lidar, H, W), ordered [t-1, t]
+    waypoints:                  (B, T, 2), predicted plan points in ego frame
+    target_speed / ego_speed:   (B,) or (B, 1), m/s
+  Output:
+    mode_logits:                (B, 2), class 0=unsafe/will_collide, 1=safe
+    mode_prob:                  (B, 2)
+  """
+
+  def __init__(self,
+               fused_channels,
+               lidar_channels,
+               hidden_dim=256,
+               vit_dim=128,
+               patch_size=16,
+               num_vit_layers=2,
+               num_ego_layers=2,
+               num_heads=4,
+               dropout=0.1):
+    super().__init__()
+    self.lidar_channels = lidar_channels
+    self.patch_size = patch_size
+    self.gap = nn.AdaptiveAvgPool2d((1, 1))
+
+    self.bev_patch_embed = nn.Conv2d(3 * lidar_channels, vit_dim, kernel_size=patch_size, stride=patch_size)
+    self.bev_cls_token = nn.Parameter(torch.zeros(1, 1, vit_dim))
+    self.bev_pos_projection = nn.Linear(2, vit_dim)
+    bev_layer = nn.TransformerEncoderLayer(
+        d_model=vit_dim,
+        nhead=num_heads,
+        dim_feedforward=hidden_dim * 2,
+        dropout=dropout,
+        activation='gelu',
+        batch_first=True,
+        norm_first=True)
+    self.bev_encoder = nn.TransformerEncoder(bev_layer, num_layers=num_vit_layers)
+
+    self.ego_token_encoder = nn.Sequential(
+        nn.Linear(5, vit_dim),
+        nn.LayerNorm(vit_dim),
+        nn.GELU(),
+        nn.Linear(vit_dim, vit_dim),
+    )
+    ego_layer = nn.TransformerEncoderLayer(
+        d_model=vit_dim,
+        nhead=num_heads,
+        dim_feedforward=hidden_dim * 2,
+        dropout=dropout,
+        activation='gelu',
+        batch_first=True,
+        norm_first=True)
+    self.ego_encoder = nn.TransformerEncoder(ego_layer, num_layers=num_ego_layers)
+    self.cross_attention = nn.MultiheadAttention(vit_dim, num_heads, dropout=dropout, batch_first=True)
+
+    self.fused_projection = nn.Sequential(
+        nn.Linear(fused_channels, vit_dim),
+        nn.LayerNorm(vit_dim),
+        nn.GELU(),
+    )
+    self.classifier = nn.Sequential(
+        nn.Linear(vit_dim * 3, hidden_dim),
+        nn.ReLU(inplace=True),
+        nn.Dropout(dropout),
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.ReLU(inplace=True),
+        nn.Dropout(dropout),
+        nn.Linear(hidden_dim, 2),
+    )
+
+  @staticmethod
+  def _speed_rollout(ego_speed, target_speed, num_steps, rollout_dt, max_acceleration, max_deceleration):
+    speed = torch.clamp(ego_speed.reshape(-1), min=0.0)
+    target_speed = torch.clamp(target_speed.reshape(-1), min=0.0)
+    speeds = []
+    dt = max(float(rollout_dt), 1e-3)
+    for _ in range(num_steps):
+      delta_speed = target_speed - speed
+      accel_step = max(0.0, float(max_acceleration)) * dt
+      decel_step = max(0.0, float(max_deceleration)) * dt
+      speed = torch.where(delta_speed > 0.0, torch.minimum(speed + accel_step, target_speed),
+                          torch.maximum(speed - decel_step, target_speed))
+      speeds.append(speed)
+    return torch.stack(speeds, dim=1)
+
+  def _make_ego_tokens(self, waypoints, target_speed, ego_speed, rollout_dt, max_acceleration, max_deceleration):
+    if waypoints is None:
+      raise ValueError('DynamicPlanSafetyModePredictionHead requires predicted waypoints or checkpoints.')
+    if target_speed is None:
+      raise ValueError('DynamicPlanSafetyModePredictionHead requires target_speed.')
+
+    if waypoints.ndim != 3 or waypoints.shape[-1] != 2:
+      raise ValueError(f'Expected waypoints with shape (B, T, 2), got {waypoints.shape}')
+
+    distances = torch.linalg.norm(waypoints, dim=2, keepdim=True)
+    num_steps = waypoints.shape[1]
+    t = torch.arange(1, num_steps + 1, dtype=waypoints.dtype, device=waypoints.device) * float(rollout_dt)
+    t = t.reshape(1, num_steps, 1).repeat(waypoints.shape[0], 1, 1)
+    velocities = self._speed_rollout(ego_speed, target_speed, num_steps, rollout_dt, max_acceleration,
+                                     max_deceleration).unsqueeze(2)
+    return torch.cat((waypoints, distances, t, velocities), dim=2)
+
+  def _bev_tokens(self, plan_safety_lidar_bev):
+    if plan_safety_lidar_bev is None:
+      raise ValueError('DynamicPlanSafetyModePredictionHead requires plan_safety_lidar_bev.')
+    expected_channels = 2 * self.lidar_channels
+    if plan_safety_lidar_bev.ndim != 4 or plan_safety_lidar_bev.shape[1] != expected_channels:
+      raise ValueError(f'Expected plan_safety_lidar_bev with shape (B, {expected_channels}, H, W), '
+                       f'got {plan_safety_lidar_bev.shape}')
+
+    bev_prev = plan_safety_lidar_bev[:, :self.lidar_channels]
+    bev_t = plan_safety_lidar_bev[:, self.lidar_channels:]
+    bev_input = torch.cat((bev_t, bev_prev, bev_t - bev_prev), dim=1)
+    patch_grid = self.bev_patch_embed(bev_input)
+    _, _, patch_h, patch_w = patch_grid.shape
+    tokens = patch_grid.flatten(2).transpose(1, 2)
+    y_coords = torch.linspace(-1.0, 1.0, patch_h, dtype=tokens.dtype, device=tokens.device)
+    x_coords = torch.linspace(-1.0, 1.0, patch_w, dtype=tokens.dtype, device=tokens.device)
+    yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
+    pos = torch.stack((yy, xx), dim=-1).reshape(1, patch_h * patch_w, 2)
+    tokens = tokens + self.bev_pos_projection(pos)
+    cls_token = self.bev_cls_token.expand(tokens.shape[0], -1, -1)
+    tokens = torch.cat((cls_token, tokens), dim=1)
+    return self.bev_encoder(tokens)
+
+  def forward(self,
+              fused_feature,
+              plan_safety_lidar_bev,
+              waypoints,
+              target_speed,
+              ego_speed,
+              rollout_dt,
+              max_acceleration,
+              max_deceleration):
+    if fused_feature.ndim == 4:
+      fused = self.gap(fused_feature)
+      fused = torch.flatten(fused, 1)
+    elif fused_feature.ndim == 2:
+      fused = fused_feature
+    else:
+      raise ValueError(f'DynamicPlanSafetyModePredictionHead expects 2D or 4D features, got {fused_feature.shape}')
+
+    bev_tokens = self._bev_tokens(plan_safety_lidar_bev)
+    ego_tokens = self._make_ego_tokens(waypoints, target_speed, ego_speed, rollout_dt, max_acceleration,
+                                       max_deceleration)
+    ego_tokens = self.ego_token_encoder(ego_tokens)
+    ego_tokens = self.ego_encoder(ego_tokens)
+    attended_ego_tokens, _ = self.cross_attention(query=ego_tokens, key=bev_tokens, value=bev_tokens)
+
+    fused_token = self.fused_projection(fused)
+    bev_summary = bev_tokens[:, 0]
+    ego_summary = attended_ego_tokens.mean(dim=1)
+    mode_logits = self.classifier(torch.cat((fused_token, bev_summary, ego_summary), dim=1))
     mode_prob = F.softmax(mode_logits, dim=1)
 
     return mode_logits, mode_prob

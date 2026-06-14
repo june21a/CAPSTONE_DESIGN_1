@@ -830,13 +830,22 @@ class GlobalConfig:
     # Mode Predictor
     # -----------------------------------------------------------------------------
     self.use_mode_prediction = True
-    self.mode_prediction_type = 'stop_move'  # Options: stop_move, plan_safety
+    self.mode_prediction_type = 'stop_move'  # Options: stop_move, plan_safety, plan_safety_dynamic
     self.mode_stop_threshold = 0.5
     self.plan_safety_hidden_dim = 256
     self.plan_safety_dropout = 0.1
     self.plan_safety_use_planning_features = False
     self.plan_safety_labeled_frames_only = False
     self.plan_safety_loss_weights = [5.0, 1.0]
+    self.plan_safety_vit_dim = 128
+    self.plan_safety_vit_patch_size = 16
+    self.plan_safety_vit_layers = 2
+    self.plan_safety_vit_heads = 4
+    self.plan_safety_ego_layers = 2
+    self.plan_safety_bev_history_stride = self.data_save_freq
+    self.plan_safety_rollout_dt = self.data_save_freq / self.carla_fps
+    self.plan_safety_max_acceleration = 1.89
+    self.plan_safety_max_deceleration = 4.82
 
   def initialize(self, root_dir='', setting='all', **kwargs):
     for k, v in kwargs.items():

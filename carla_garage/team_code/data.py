@@ -101,7 +101,7 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
 
         plan_safety_labeled_frames = None
         plan_safety_labeled_only = (
-            self.config.use_mode_prediction and self.config.mode_prediction_type == 'plan_safety' and
+            self.config.use_mode_prediction and self.config.mode_prediction_type in ('plan_safety', 'plan_safety_dynamic') and
             getattr(self.config, 'plan_safety_labeled_frames_only', False)
         )
         if plan_safety_labeled_only:
@@ -321,7 +321,7 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
     bev_semantics_augmented = self.bev_semantics_augmented[index]
     depth = self.depth[index]
     depth_augmented = self.depth_augmented[index]
-    lidars = self.lidars[index]
+    lidar_paths = self.lidars[index]
     boxes = self.boxes[index]
     future_boxes = self.future_boxes[index]
     mode_labels = self.mode_labels[index]
@@ -435,7 +435,7 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
               future_boxes_i = ujson.load(f2)
 
         if not self.config.use_plant:
-          las_object = laspy.read(str(lidars[i], encoding='utf-8'))
+          las_object = laspy.read(str(lidar_paths[i], encoding='utf-8'))
           lidars_i = las_object.xyz
 
           images_i = cv2.imread(str(images[i], encoding='utf-8'), cv2.IMREAD_COLOR)
@@ -561,7 +561,7 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
 
     current_measurement = loaded_measurements[self.config.seq_len - 1]
     if self.config.use_mode_prediction:
-      if self.config.mode_prediction_type == 'plan_safety':
+      if self.config.mode_prediction_type in ('plan_safety', 'plan_safety_dynamic'):
         mode_label_file = str(plan_safety_labels, encoding='utf-8')
       else:
         mode_label_file = str(mode_labels, encoding='utf-8')
@@ -577,7 +577,7 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
         mode_labels_i = None
 
       frame_key = f'{sample_start + self.config.seq_len - 1:04}'
-      if self.config.mode_prediction_type == 'plan_safety':
+      if self.config.mode_prediction_type in ('plan_safety', 'plan_safety_dynamic'):
         self.add_plan_safety_sample(data, current_measurement, mode_labels_i, frame_key)
       elif mode_labels_i is not None and frame_key in mode_labels_i.get('frames', {}):
         data['mode_label'] = int(mode_labels_i['frames'][frame_key])
@@ -654,6 +654,29 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
         lidars.append(lidar_bev)
 
       lidar_bev = np.concatenate(lidars, axis=0)
+
+      if self.config.use_mode_prediction and self.config.mode_prediction_type == 'plan_safety_dynamic':
+        current_lidar_bev = lidars[-1]
+        current_lidar_path = str(lidar_paths[self.config.seq_len - 1], encoding='utf-8')
+        lidar_dir = os.path.dirname(current_lidar_path)
+        measurement_dir = str(measurements[0], encoding='utf-8')
+        current_frame = sample_start + self.config.seq_len - 1
+        prev_frame = max(0, current_frame - 1)
+        prev_lidar_path = os.path.join(lidar_dir, f'{prev_frame:04}.laz')
+        prev_measurement_path = os.path.join(measurement_dir, f'{prev_frame:04}.json.gz')
+        if os.path.isfile(prev_lidar_path) and os.path.isfile(prev_measurement_path):
+          with gzip.open(prev_measurement_path, 'rt', encoding='utf-8') as f1:
+            prev_measurement = ujson.load(f1)
+          prev_lidar = laspy.read(prev_lidar_path).xyz
+          prev_lidar = self.align(prev_lidar,
+                                  prev_measurement,
+                                  current_measurement,
+                                  y_augmentation=aug_translation,
+                                  yaw_augmentation=aug_rotation)
+          prev_lidar_bev = self.lidar_to_histogram_features(prev_lidar, use_ground_plane=self.config.use_ground_plane)
+        else:
+          prev_lidar_bev = current_lidar_bev.copy()
+        data['plan_safety_lidar'] = np.concatenate((prev_lidar_bev, current_lidar_bev), axis=0).astype(np.float32)
 
       if self.config.lidar_seq_len > 1:
         temporal_lidars = []
@@ -743,6 +766,7 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
 
     data['target_speed'] = target_speed_index
     data['target_speed_twohot'] = target_speed_twohot
+    data['target_speed_scalar'] = np.float32(current_measurement['target_speed'])
 
     if not self.config.use_plant:
       lidar_bev = self.lidar_augmenter_func(image=np.transpose(lidar_bev, (1, 2, 0)))
