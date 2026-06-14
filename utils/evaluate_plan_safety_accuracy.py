@@ -15,7 +15,7 @@ from typing import Any
 
 DEFAULT_EXP = Path(
     "/home/ec2-user/AD_challenge/CAPSTONE_DESIGN_1/"
-    "carla_garage/results/pretrained_dynamic_plan_safety_head"
+    "carla_garage/results/pretrained_baseline_plan_safety_head"
 )
 COLLISION_KEYS = ("collisions_layout", "collisions_pedestrian", "collisions_vehicle")
 COLLISION_PATTERN = re.compile(

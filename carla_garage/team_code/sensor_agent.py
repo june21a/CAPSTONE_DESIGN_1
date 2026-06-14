@@ -1092,22 +1092,22 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       else:
         pred_target_speed_index = torch.argmax(pred_target_speed_ensemble)
         pred_target_speed_scalar = self.inference_target_speeds[pred_target_speed_index]
-      # if pred_mode_ensemble is not None:
-      #   stop_threshold = getattr(self.config, 'mode_stop_threshold', 0.5)
+      if pred_mode_ensemble is not None:
+        stop_threshold = getattr(self.config, 'mode_stop_threshold', 0.5)
         
-      #   if use_heuristic:
-      #     stop_mode_active = pred_mode_ensemble[0].item() >= stop_threshold
-      #     current_game_time = float(timestamp) if timestamp is not None else self.step * self.config.carla_frame_rate
-      #     can_activate_stop_mode = current_game_time >= self.stop_mode_cooldown_until
-      #     if stop_mode_active and can_activate_stop_mode:
-      #       self.stop_mode_zero_until = current_game_time + 1.5  # 6frame
-      #       self.stop_mode_cooldown_until = self.stop_mode_zero_until + 3.0 # 60frame
+        if use_heuristic:
+          stop_mode_active = pred_mode_ensemble[0].item() >= stop_threshold
+          current_game_time = float(timestamp) if timestamp is not None else self.step * self.config.carla_frame_rate
+          can_activate_stop_mode = current_game_time >= self.stop_mode_cooldown_until
+          if stop_mode_active and can_activate_stop_mode:
+            self.stop_mode_zero_until = current_game_time + 1.5  # 6frame
+            self.stop_mode_cooldown_until = self.stop_mode_zero_until + 3.0 # 60frame
 
-      #     if self.stop_mode_zero_until is not None and current_game_time < self.stop_mode_zero_until:
-      #       pred_target_speed_scalar = self.inference_target_speeds[0]
-      #   else:
-      #     if pred_mode_ensemble[0].item() >= stop_threshold:
-      #       pred_target_speed_scalar = self.inference_target_speeds[0]
+          if self.stop_mode_zero_until is not None and current_game_time < self.stop_mode_zero_until:
+            pred_target_speed_scalar = self.inference_target_speeds[0]
+        else:
+          if pred_mode_ensemble[0].item() >= stop_threshold:
+            pred_target_speed_scalar = self.inference_target_speeds[0]
         
     else:
       pred_target_speed_scalar = None
