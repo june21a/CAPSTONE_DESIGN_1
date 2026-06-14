@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 
 
-BASE = Path("/workspace/CAPSTONE_DESIGN_1/carla_garage/results/temp")
+BASE = Path("/workspace/CAPSTONE_DESIGN_1/carla_garage/results/code_fix_b2d55/vidoes_for_collisions")
 DEBUG_JSON = BASE / "debug_results.json"
 OUT_ROOT = BASE / "temp_collisions_file"
 FPS = 10

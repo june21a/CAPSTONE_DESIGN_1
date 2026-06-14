@@ -4,7 +4,9 @@ Run it by giving it as the agent option to the
 leaderboard/leaderboard/leaderboard_evaluator.py file
 """
 
+import csv
 import os
+import subprocess
 from copy import deepcopy
 
 import cv2
@@ -127,16 +129,37 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     collision_prediction_horizon = float(os.environ.get('COLLISION_PREDICTION_HORIZON', 3.0))
     collision_prediction_step = float(os.environ.get('COLLISION_PREDICTION_STEP', 0.1))
     collision_update_interval = float(os.environ.get('COLLISION_UPDATE_INTERVAL', 0.1))
+    collision_warning_confirmations = int(os.environ.get('COLLISION_WARNING_CONFIRMATIONS', 2))
+    collision_safe_release_seconds = float(os.environ.get('COLLISION_SAFE_RELEASE_SECONDS', 0.5))
+    collision_longitudinal_margin = float(os.environ.get('COLLISION_LONGITUDINAL_MARGIN', 0.5))
+    collision_lateral_margin = float(os.environ.get('COLLISION_LATERAL_MARGIN', 0.2))
+    waypoint_interval = self.config.data_save_freq * self.config.wp_dilation / self.config.carla_fps
     self.collision_predictor = RealTimeCollisionPredictor(
         fps=self.config.carla_fps,
         update_interval=collision_update_interval,
         prediction_horizon=collision_prediction_horizon,
         prediction_step=collision_prediction_step,
-        ego_extent=(self.config.ego_extent_x, self.config.ego_extent_y))
+        waypoint_interval=waypoint_interval,
+        ego_extent=(self.config.ego_extent_x, self.config.ego_extent_y),
+        warning_confirmation_count=collision_warning_confirmations,
+        safe_release_seconds=collision_safe_release_seconds,
+        longitudinal_margin=collision_longitudinal_margin,
+        lateral_margin=collision_lateral_margin)
     self.collision_prediction_result = self.collision_predictor.latest_result
+    self.collision_prediction_updated = False
+    self.collision_log_enabled = strtobool(os.environ.get('COLLISION_LOG', '1'))
+    self.collision_log_header_written = False
     print('Collision prediction:', self.collision_prediction_enabled,
           f'horizon={collision_prediction_horizon:.1f}s',
           f'update={collision_update_interval:.1f}s')
+    self.collision_video_enabled = strtobool(os.environ.get('COLLISION_VIDEO', '1'))
+    self.collision_video_fps = max(1.0, float(os.environ.get('COLLISION_VIDEO_FPS', self.config.carla_fps)))
+    self.collision_video_max_seconds = float(os.environ.get('COLLISION_VIDEO_MAX_SECONDS', 20.0))
+    if self.collision_video_enabled:
+      self.config.debug = True
+    print('Collision video:', self.collision_video_enabled,
+          f'fps={self.collision_video_fps:g}',
+          f'max_duration={self.collision_video_max_seconds:g}s')
 
     self.compile = int(os.environ.get('COMPILE', 0)) == 1
 
@@ -239,6 +262,13 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     if self.save_path is not None and route_index is not None:
       self.save_path = pathlib.Path(self.save_path) / route_index
       pathlib.Path(self.save_path).mkdir(parents=True, exist_ok=True)
+
+      if self.collision_log_enabled:
+        for collision_log_path in ('collision_warning_log.csv', 'collision_warning_log.jsonl'):
+          collision_log_file = pathlib.Path(self.save_path) / collision_log_path
+          if collision_log_file.exists():
+            collision_log_file.unlink()
+        self.collision_log_header_written = False
 
       self.lon_logger = ScenarioLogger(
           save_path=self.save_path,
@@ -996,13 +1026,6 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     else:
       bbs_vehicle_coordinate_system = None
 
-    if self.collision_prediction_enabled and self.collision_predictor.should_update(self.step):
-      self.collision_prediction_result = self.collision_predictor.update(
-          step=self.step,
-          ego_speed=gt_velocity.item(),
-          ego_pose=(ego_x, ego_y, ego_theta),
-          bounding_boxes=bbs_vehicle_coordinate_system)
-
     if self.stop_sign_controller:
       stop_for_stop_sign = self.stop_sign_controller_step(gt_velocity.item())
 
@@ -1011,6 +1034,21 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     if self.config.use_wp_gru:
       self.pred_wp = torch.stack(pred_wps, dim=0).mean(dim=0)
+
+    self.collision_prediction_updated = False
+    if self.collision_prediction_enabled and self.collision_predictor.should_update(self.step):
+      predicted_waypoints = None
+      if self.config.use_wp_gru:
+        predicted_waypoints = self.pred_wp.detach().cpu().numpy()[0]
+      self.collision_prediction_result = self.collision_predictor.update(
+          step=self.step,
+          ego_speed=gt_velocity.item(),
+          ego_pose=(ego_x, ego_y, ego_theta),
+          bounding_boxes=bbs_vehicle_coordinate_system,
+          predicted_waypoints=predicted_waypoints)
+      self.collision_prediction_updated = True
+
+    self._log_collision_warning_frame(gt_velocity.item())
 
     # calculate target speed scalar from model predictions
     if self.config.use_controller_input_prediction:
@@ -1054,7 +1092,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
           tick_data['rgb'],
           lidar_bev,
           tick_data['target_point'],
-          pred_wp,
+          self.pred_wp if self.config.use_wp_gru else pred_wp,
           target_point_next=tick_data['target_point_next'] if self.config.two_tp_input else None,
           pred_semantic=pred_semantic,
           pred_bev_semantic=pred_bev_semantic,
@@ -1256,6 +1294,111 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       box_pred[:2] = (local_rot_matrix.T @ (box_pred[:2] - pos_diff).T).T
       box_pred[4] = t_u.normalize_angle(box_pred[4] - rot_diff)
 
+  @staticmethod
+  def _collision_warning_level(status):
+    levels = {
+        'SAFE': 0,
+        'CAUTION': 1,
+        'COLLISION RISK': 2,
+        'IMMINENT': 3,
+    }
+    return levels.get(status, 0)
+
+  def _collision_log_row(self, ego_speed):
+    result = getattr(self, 'collision_prediction_result', {}) or {}
+    status = result.get('status', 'SAFE')
+    warning_level = self._collision_warning_level(status)
+    collision_predicted = 0 if warning_level == 0 else 1
+    raw_ttc = result.get('raw_time_to_collision_s')
+    raw_collision_predicted = 0 if raw_ttc is None else 1
+    return {
+        'frame': int(self.step),
+        'time_s': float(self.step) / float(self.config.carla_fps),
+        'prediction_updated': int(getattr(self, 'collision_prediction_updated', False)),
+        'status': status,
+        'warning_level': warning_level,
+        'collision_predicted': collision_predicted,
+        'direction': result.get('direction'),
+        'time_to_collision_s': result.get('time_to_collision_s'),
+        'track_id': result.get('track_id'),
+        'raw_collision_predicted': raw_collision_predicted,
+        'raw_time_to_collision_s': raw_ttc,
+        'ego_speed_mps': float(ego_speed),
+        'prediction_horizon_s': result.get('prediction_horizon_s'),
+        'prediction_step_s': result.get('prediction_step_s'),
+        'ego_prediction_model': result.get('ego_prediction_model'),
+        'surrounding_prediction_model': result.get('surrounding_prediction_model'),
+    }
+
+  def _log_collision_warning_frame(self, ego_speed):
+    if not getattr(self, 'collision_log_enabled', False):
+      return
+    if getattr(self, 'save_path', None) is None:
+      return
+    if not getattr(self, 'collision_prediction_enabled', False):
+      return
+
+    log_dir = pathlib.Path(self.save_path)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    row = self._collision_log_row(ego_speed)
+    csv_path = log_dir / 'collision_warning_log.csv'
+    jsonl_path = log_dir / 'collision_warning_log.jsonl'
+    fieldnames = [
+        'frame', 'time_s', 'prediction_updated', 'status', 'warning_level', 'collision_predicted',
+        'direction', 'time_to_collision_s', 'track_id', 'raw_collision_predicted',
+        'raw_time_to_collision_s', 'ego_speed_mps', 'prediction_horizon_s', 'prediction_step_s',
+        'ego_prediction_model', 'surrounding_prediction_model'
+    ]
+
+    write_header = not csv_path.exists() or not getattr(self, 'collision_log_header_written', False)
+    with csv_path.open('a', encoding='utf-8', newline='') as outfile:
+      writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+      if write_header:
+        writer.writeheader()
+        self.collision_log_header_written = True
+      writer.writerow(row)
+
+    with jsonl_path.open('a', encoding='utf-8') as outfile:
+      ujson.dump(row, outfile)
+      outfile.write('\n')
+
+  def _generate_collision_video(self):
+    """Combine model_results PNG frames into a route-level MP4."""
+    if not getattr(self, 'collision_video_enabled', False):
+      return
+    if getattr(self, 'save_path', None) is None:
+      return
+
+    frame_directory = pathlib.Path(self.save_path) / 'model_results'
+    frame_paths = sorted(frame_directory.glob('*.png'))
+    if not frame_paths:
+      print('Collision video skipped: no model_results PNG frames were found.')
+      return
+
+    output_path = pathlib.Path(self.save_path) / 'collision_warning.mp4'
+    command = [
+        'ffmpeg', '-y', '-loglevel', 'error',
+        '-framerate', f'{self.collision_video_fps:g}',
+        '-pattern_type', 'glob', '-i', str(frame_directory / '*.png'),
+    ]
+    if self.collision_video_max_seconds > 0.0:
+      command.extend(['-t', f'{self.collision_video_max_seconds:g}'])
+    command.extend([
+        '-an', '-c:v', 'libx264', '-preset', 'fast',
+        '-pix_fmt', 'yuv420p', '-movflags', '+faststart', str(output_path),
+    ])
+
+    try:
+      subprocess.run(command, check=True, capture_output=True, text=True)
+      duration = len(frame_paths) / self.collision_video_fps
+      if self.collision_video_max_seconds > 0.0:
+        duration = min(duration, self.collision_video_max_seconds)
+      print(f'Collision warning video saved: {output_path} ({duration:.1f}s)')
+    except FileNotFoundError:
+      print('Collision video skipped: ffmpeg is not installed or not in PATH.')
+    except subprocess.CalledProcessError as error:
+      print(f'Collision video generation failed: {error.stderr.strip()}')
+
   def destroy(self, results=None):  # pylint: disable=locally-disabled, unused-argument
     """
     Gets called after a route finished.
@@ -1263,6 +1406,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     Also writes logging files to disk.
     """
     if getattr(self, 'save_path', None) is not None:
+      self._generate_collision_video()
       if getattr(self, 'lon_logger', None) is not None:
         self.lon_logger.dump_to_json()
       if getattr(self, 'nets', None) and len(self.nets[0].speed_histogram) > 0:

@@ -910,7 +910,7 @@ class LidarCenterNet(nn.Module):
         inv_brake = 1.0 - box[6]
         color_box = deepcopy(color_classes[int(box[7])])
         color_box[1] = color_box[1] * inv_brake
-        box = t_u.bb_vehicle_to_image_system(box, loc_pixels_per_meter, self.config.min_x, self.config.min_y)
+        box = t_u.bb_vehicle_to_image_system(box.copy(), loc_pixels_per_meter, self.config.min_x, self.config.min_y)
         images_lidar = t_u.draw_box(images_lidar, box, color=color_box, pixel_per_meter=loc_pixels_per_meter)
 
     if gt_bbs is not None:
@@ -949,6 +949,7 @@ class LidarCenterNet(nn.Module):
     if collision_prediction is not None:
       status = collision_prediction.get('status', 'SAFE')
       time_to_collision = collision_prediction.get('time_to_collision_s')
+      collision_direction = collision_prediction.get('direction')
       status_colors = {
           'SAFE': (0, 150, 0),
           'CAUTION': (220, 170, 0),
@@ -960,7 +961,7 @@ class LidarCenterNet(nn.Module):
       if time_to_collision is None:
         warning_text = f'{status} | No collision within {collision_prediction.get("prediction_horizon_s", 3.0):.1f}s'
       else:
-        warning_text = f'{status} | TTC: {time_to_collision:.1f}s'
+        warning_text = f'{status} | {collision_direction} | TTC: {time_to_collision:.1f}s'
       cv2.putText(rgb_image, warning_text, (18, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2,
                   cv2.LINE_AA)
 
