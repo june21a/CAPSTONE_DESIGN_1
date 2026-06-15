@@ -128,6 +128,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     self.collision_prediction_enabled = strtobool(os.environ.get('COLLISION_PREDICTION', '1'))
     self.config.collision_prediction_enabled = self.collision_prediction_enabled
     self.config.control_heuristic = strtobool(os.environ.get('CONTROL_HEURISTIC', '0'))
+    self.config.collision_side_curvature_scale = float(os.environ.get('COLLISION_SIDE_CURVATURE_SCALE', '0.5'))
     print('Control heuristic:', self.config.control_heuristic)
     collision_prediction_horizon = float(os.environ.get('COLLISION_PREDICTION_HORIZON', 3.0))
     collision_prediction_step = float(os.environ.get('COLLISION_PREDICTION_STEP', 0.1))
@@ -136,6 +137,14 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     collision_safe_release_seconds = float(os.environ.get('COLLISION_SAFE_RELEASE_SECONDS', 0.5))
     collision_longitudinal_margin = float(os.environ.get('COLLISION_LONGITUDINAL_MARGIN', 0.5))
     collision_lateral_margin = float(os.environ.get('COLLISION_LATERAL_MARGIN', 0.2))
+    collision_use_ukf = strtobool(os.environ.get('COLLISION_USE_UKF', '1'))
+    collision_ukf_process_position_std = float(os.environ.get('COLLISION_UKF_PROCESS_POSITION_STD', 0.8))
+    collision_ukf_process_yaw_std_deg = float(os.environ.get('COLLISION_UKF_PROCESS_YAW_STD_DEG', 5.0))
+    collision_ukf_process_speed_std = float(os.environ.get('COLLISION_UKF_PROCESS_SPEED_STD', 2.0))
+    collision_ukf_process_yaw_rate_std_deg = float(os.environ.get('COLLISION_UKF_PROCESS_YAW_RATE_STD_DEG', 15.0))
+    collision_ukf_measurement_position_std = float(os.environ.get('COLLISION_UKF_MEASUREMENT_POSITION_STD', 0.7))
+    collision_ukf_measurement_yaw_std_deg = float(os.environ.get('COLLISION_UKF_MEASUREMENT_YAW_STD_DEG', 8.0))
+    collision_ukf_measurement_speed_std = float(os.environ.get('COLLISION_UKF_MEASUREMENT_SPEED_STD', 2.5))
     waypoint_interval = self.config.data_save_freq * self.config.wp_dilation / self.config.carla_fps
     self.collision_predictor = RealTimeCollisionPredictor(
         fps=self.config.carla_fps,
@@ -144,6 +153,14 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         prediction_step=collision_prediction_step,
         waypoint_interval=waypoint_interval,
         ego_extent=(self.config.ego_extent_x, self.config.ego_extent_y),
+        use_ukf=collision_use_ukf,
+        ukf_process_position_std=collision_ukf_process_position_std,
+        ukf_process_yaw_std_deg=collision_ukf_process_yaw_std_deg,
+        ukf_process_speed_std=collision_ukf_process_speed_std,
+        ukf_process_yaw_rate_std_deg=collision_ukf_process_yaw_rate_std_deg,
+        ukf_measurement_position_std=collision_ukf_measurement_position_std,
+        ukf_measurement_yaw_std_deg=collision_ukf_measurement_yaw_std_deg,
+        ukf_measurement_speed_std=collision_ukf_measurement_speed_std,
         warning_confirmation_count=collision_warning_confirmations,
         safe_release_seconds=collision_safe_release_seconds,
         longitudinal_margin=collision_longitudinal_margin,
@@ -154,7 +171,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     self.collision_log_header_written = False
     print('Collision prediction:', self.collision_prediction_enabled,
           f'horizon={collision_prediction_horizon:.1f}s',
-          f'update={collision_update_interval:.1f}s')
+          f'update={collision_update_interval:.1f}s',
+          f'model={self.collision_predictor.latest_result["surrounding_prediction_model"]}')
     self.collision_video_enabled = strtobool(os.environ.get('COLLISION_VIDEO', '1'))
     self.collision_video_fps = max(1.0, float(os.environ.get('COLLISION_VIDEO_FPS', self.config.carla_fps)))
     self.collision_video_max_seconds = float(os.environ.get('COLLISION_VIDEO_MAX_SECONDS', 20.0))
@@ -1113,12 +1131,18 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     if self.config.inference_direct_controller and self.config.use_controller_input_prediction:
       pred_checkpoints = torch.stack(pred_checkpoints, dim=0).mean(dim=0).detach().cpu().numpy()
+      if self.collision_prediction_enabled:
+        pred_checkpoints, pred_target_speed_scalar = self._apply_collision_prediction_control(
+            pred_checkpoints,
+            pred_target_speed_scalar,
+            self.collision_prediction_result)
       steer, throttle, brake = self.nets[0].control_pid_direct(
           pred_checkpoints,
           pred_target_speed_scalar,
           gt_velocity,
           bboxes=bbs_vehicle_coordinate_system,
-          collision_status=self.collision_prediction_result.get('status', 'SAFE'))
+          collision_status=self.collision_prediction_result.get('status', 'SAFE'),
+          collision_direction=self.collision_prediction_result.get('direction'))
     elif self.config.use_wp_gru and not self.config.inference_direct_controller:
       steer, throttle, brake = self.nets[0].control_pid(self.pred_wp,
                                                         gt_velocity,
@@ -1298,6 +1322,56 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     for _, box_pred in enumerate(boxes):
       box_pred[:2] = (local_rot_matrix.T @ (box_pred[:2] - pos_diff).T).T
       box_pred[4] = t_u.normalize_angle(box_pred[4] - rot_diff)
+
+  def _maximum_collision_target_speed(self):
+    return max(20.0, float(max(self.config.target_speeds)))
+
+  def _lower_checkpoint_curvature(self, pred_checkpoints):
+    adjusted_checkpoints = np.array(pred_checkpoints, copy=True)
+    if adjusted_checkpoints.ndim >= 2 and adjusted_checkpoints.shape[-1] >= 2:
+      adjusted_checkpoints[..., 1] *= self.config.collision_side_curvature_scale
+    return adjusted_checkpoints
+
+  @staticmethod
+  def _ttc_score(time_to_collision):
+    return float('inf') if time_to_collision is None else float(time_to_collision)
+
+  def _apply_collision_prediction_control(self, pred_checkpoints, pred_target_speed, collision_result):
+    status = str(collision_result.get('status', 'SAFE')).upper().replace('_', ' ')
+    if status in ('SAFE', 'CAUTION'):
+      return pred_checkpoints, pred_target_speed
+
+    direction = str(collision_result.get('direction', '')).upper().replace('BACK', 'REAR')
+    max_target_speed = self._maximum_collision_target_speed()
+
+    if direction == 'REAR':
+      return pred_checkpoints, max_target_speed
+
+    if direction not in ('LEFT', 'RIGHT'):
+      return pred_checkpoints, pred_target_speed
+
+    lower_curvature_checkpoints = self._lower_checkpoint_curvature(pred_checkpoints)
+    candidates = [
+        (lower_curvature_checkpoints, pred_target_speed),
+        (pred_checkpoints, max_target_speed),
+        (lower_curvature_checkpoints, max_target_speed),
+    ]
+
+    best_checkpoints = pred_checkpoints
+    best_target_speed = pred_target_speed
+    best_score = -float('inf')
+    for candidate_checkpoints, candidate_target_speed in candidates:
+      candidate_ttc = self.collision_predictor.evaluate_min_ttc(
+          ego_speed=candidate_target_speed,
+          predicted_waypoints=candidate_checkpoints,
+          directions=(direction,))
+      candidate_score = self._ttc_score(candidate_ttc)
+      if candidate_score > best_score:
+        best_score = candidate_score
+        best_checkpoints = candidate_checkpoints
+        best_target_speed = candidate_target_speed
+
+    return best_checkpoints, best_target_speed
 
   @staticmethod
   def _collision_warning_level(status):

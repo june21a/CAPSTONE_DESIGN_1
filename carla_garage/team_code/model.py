@@ -506,7 +506,8 @@ class LidarCenterNet(nn.Module):
                          ego_vehicle_location=0,
                          ego_vehicle_rotation=0,
                          bboxes=None,
-                         collision_status='SAFE'):
+                         collision_status='SAFE',
+                         collision_direction=None):
     if self.make_histogram:
       self.speed_histogram.append(pred_target_speed * 3.6)
 
@@ -516,7 +517,10 @@ class LidarCenterNet(nn.Module):
     collision_prediction_enabled = getattr(self.config, 'collision_prediction_enabled', False)
     control_heuristic = getattr(self.config, 'control_heuristic', False)
     collision_status = str(collision_status).upper().replace('_', ' ')
-    emergency_brake = collision_prediction_enabled and collision_status not in ('SAFE', 'CAUTION')
+    collision_direction = str(collision_direction).upper().replace('BACK', 'REAR')
+    collision_warning = collision_status not in ('SAFE', 'CAUTION')
+    emergency_brake = (collision_prediction_enabled and collision_warning
+                       and collision_direction in ('FRONT', 'NONE'))
 
     brake = pred_target_speed < 0.01 or (speed / pred_target_speed) > self.config.brake_ratio
 
