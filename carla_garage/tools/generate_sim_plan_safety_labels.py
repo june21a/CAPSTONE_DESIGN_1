@@ -1399,7 +1399,7 @@ def main() -> int:
     parser.add_argument(
         "--collision-region-radius",
         type=float,
-        default=0.25,
+        default=0.5,
         help=(
             "Optional radius in meters around the future collision pose treated as the collision region. "
             "Defaults to the ego_car extent from dataset boxes, falling back to the built-in ego extent."

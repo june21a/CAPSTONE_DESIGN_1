@@ -19,7 +19,7 @@ ROUTES="./leaderboard/data/bench2drive220_test_sample_55.xml"
 SAVE_PATH_DIR="./results/pretrained_dynamic_plan_safety_head_b2d55"
 CHECKPOINT="${SAVE_PATH_DIR}/debug_results.json"
 RESUME=1
-USE_HEURISTIC=0
+USE_HEURISTIC=1
 
 # ===== Environment Variables =====
 export DEBUG_CHALLENGE=1
