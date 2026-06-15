@@ -207,7 +207,7 @@ marimo/_lsp/
 __marimo__/
 
 # training data of carla garage
-training_data
+*training_data*
 
 # vscode
 .vscode
