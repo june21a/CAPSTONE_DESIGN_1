@@ -126,6 +126,9 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     self.config.debug = int(os.environ.get('DEBUG_CHALLENGE', 0)) == 1
 
     self.collision_prediction_enabled = strtobool(os.environ.get('COLLISION_PREDICTION', '1'))
+    self.config.collision_prediction_enabled = self.collision_prediction_enabled
+    self.config.control_heuristic = strtobool(os.environ.get('CONTROL_HEURISTIC', '0'))
+    print('Control heuristic:', self.config.control_heuristic)
     collision_prediction_horizon = float(os.environ.get('COLLISION_PREDICTION_HORIZON', 3.0))
     collision_prediction_step = float(os.environ.get('COLLISION_PREDICTION_STEP', 0.1))
     collision_update_interval = float(os.environ.get('COLLISION_UPDATE_INTERVAL', 0.1))
@@ -993,6 +996,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
           lidar_attention_maps.append(latest_lidar_attention_map)
         # Only convert bounding boxes when they are used.
         if self.config.detect_boxes and (compute_debug_output or self.collision_prediction_enabled or
+                                         self.config.control_heuristic or
                                          self.config.backbone in ('aim') or self.stop_sign_controller):
           pred_bounding_box = self.nets[i].convert_features_to_bb_metric(pred_bb_features)
         else:
@@ -1018,6 +1022,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     # Average the predictions from ensembles
     if self.config.detect_boxes and (compute_debug_output or self.collision_prediction_enabled or
+                                     self.config.control_heuristic or
                                      self.config.backbone in ('aim') or self.stop_sign_controller):
       # We average bounding boxes by using non-maximum suppression on the set of all detected boxes.
       bbs_vehicle_coordinate_system = t_u.non_maximum_suppression(bounding_boxes, self.config.iou_treshold_nms)
@@ -1109,11 +1114,11 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     if self.config.inference_direct_controller and self.config.use_controller_input_prediction:
       pred_checkpoints = torch.stack(pred_checkpoints, dim=0).mean(dim=0).detach().cpu().numpy()
       steer, throttle, brake = self.nets[0].control_pid_direct(
-    pred_checkpoints,
-    pred_target_speed_scalar,
-    gt_velocity,
-    bboxes=bbs_vehicle_coordinate_system
-)
+          pred_checkpoints,
+          pred_target_speed_scalar,
+          gt_velocity,
+          bboxes=bbs_vehicle_coordinate_system,
+          collision_status=self.collision_prediction_result.get('status', 'SAFE'))
     elif self.config.use_wp_gru and not self.config.inference_direct_controller:
       steer, throttle, brake = self.nets[0].control_pid(self.pred_wp,
                                                         gt_velocity,

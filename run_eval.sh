@@ -13,23 +13,24 @@ export PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${SCENARIO_RUNNER_ROOT}:${LEADE
 
 # ===== Path Settings =====
 CARLA_GARAGE_DIR="${CURRENT_DIR}/carla_garage"
-AGENT_CONFIG="./pretrained_models/all_towns"
-AGENT="./team_code/comparison_agent.py"
+AGENT_CONFIG="/home/ec2-user/AD_challenge/experiments/pretrained_baseline"
+AGENT="./team_code/sensor_agent.py"
 ROUTES="./leaderboard/data/bench2drive220_test_sample_55.xml"
-SAVE_PATH_DIR="./results/b2d55_debug"
+SAVE_PATH_DIR="./results/baseline_using_collision_predictor_b2d55"
 CHECKPOINT="${SAVE_PATH_DIR}/debug_results.json"
 RESUME=1
 
 # ===== Environment Variables =====
 export DEBUG_CHALLENGE=1
 export COLLISION_PREDICTION=1
+export CONTROL_HEURISTIC=0
 export COLLISION_PREDICTION_HORIZON=3.0
 export COLLISION_PREDICTION_STEP=0.1
 export COLLISION_UPDATE_INTERVAL=0.1
 export SAVE_PATH="${SAVE_PATH_DIR}"
 export COLLECT_SENSOR_DATA=1
-export ATTENTION_VIS=1
-export VISION_TASK_VIS=1
+export ATTENTION_VIS=0
+export VISION_TASK_VIS=0
 export ATTENTION_SAVE_FREQ=1
 export DISABLE_CUDNN=0
 export FORCE_CPU=0
