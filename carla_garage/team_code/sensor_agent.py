@@ -108,6 +108,12 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     self.config = GlobalConfig()
     # Overwrite all properties that were set in the saved config.
     self.config.__dict__.update(loaded_config.__dict__)
+    data_save_freq_override = int(os.environ.get('DATA_SAVE_FREQ', 0))
+    if data_save_freq_override > 0:
+      self.config.data_save_freq = data_save_freq_override
+      print('DATA_SAVE_FREQ override: ', self.config.data_save_freq)
+    else:
+      print('Using config data_save_freq: ', self.config.data_save_freq)
 
     # For models supporting different output modalities we select which one to use here.
     # 0: Waypoints
