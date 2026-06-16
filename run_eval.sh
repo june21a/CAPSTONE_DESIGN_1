@@ -16,13 +16,13 @@ CARLA_GARAGE_DIR="${CURRENT_DIR}/carla_garage"
 AGENT_CONFIG="/home/ec2-user/AD_challenge/experiments/pretrained_baseline"
 AGENT="./team_code/sensor_agent.py"
 ROUTES="./leaderboard/data/bench2drive220_test_sample_55.xml"
-SAVE_PATH_DIR="./results/baseline_using_collision_predictor_b2d55"
+SAVE_PATH_DIR="./results/baseline_using_collision_predictor_UKF_simpleStop_b2d55"
 CHECKPOINT="${SAVE_PATH_DIR}/debug_results.json"
 RESUME=1
 
 # ===== Environment Variables =====
 export DEBUG_CHALLENGE=1
-export COLLISION_PREDICTION=1
+export COLLISION_PREDICTION=simple_stop
 export COLLISION_USE_UKF=1
 export CONTROL_HEURISTIC=0
 export COLLISION_PREDICTION_HORIZON=3.0

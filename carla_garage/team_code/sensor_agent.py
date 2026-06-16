@@ -57,6 +57,15 @@ def strtobool(v):
   return str(v).lower() in ('yes', 'y', 'true', 't', '1', 'True')
 
 
+def parse_collision_prediction_setting(value):
+  normalized = str(value).strip().lower().replace('-', '_')
+  if normalized in ('simple', 'simple_stop', 'stop', 'zero_speed'):
+    return True, 'simple_stop'
+  if normalized in ('direction_aware', 'default', 'enabled'):
+    return True, 'direction_aware'
+  return strtobool(value), 'direction_aware'
+
+
 class SensorAgent(autonomous_agent.AutonomousAgent):
   """
     Main class that runs the agents with the run_step function
@@ -125,7 +134,9 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     # If set to true, will generate visualizations at SAVE_PATH
     self.config.debug = int(os.environ.get('DEBUG_CHALLENGE', 0)) == 1
 
-    self.collision_prediction_enabled = strtobool(os.environ.get('COLLISION_PREDICTION', '1'))
+    self.collision_prediction_enabled, self.collision_prediction_control_mode = parse_collision_prediction_setting(
+        os.environ.get('COLLISION_PREDICTION', '1'))
+    self.config.collision_prediction_control_mode = self.collision_prediction_control_mode
     self.config.collision_prediction_enabled = self.collision_prediction_enabled
     self.config.control_heuristic = strtobool(os.environ.get('CONTROL_HEURISTIC', '0'))
     self.config.collision_side_curvature_scale = float(os.environ.get('COLLISION_SIDE_CURVATURE_SCALE', '0.5'))
@@ -170,6 +181,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     self.collision_log_enabled = strtobool(os.environ.get('COLLISION_LOG', '1'))
     self.collision_log_header_written = False
     print('Collision prediction:', self.collision_prediction_enabled,
+          f'control={self.collision_prediction_control_mode}',
           f'horizon={collision_prediction_horizon:.1f}s',
           f'update={collision_update_interval:.1f}s',
           f'model={self.collision_predictor.latest_result["surrounding_prediction_model"]}')
@@ -1340,6 +1352,9 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     status = str(collision_result.get('status', 'SAFE')).upper().replace('_', ' ')
     if status in ('SAFE', 'CAUTION'):
       return pred_checkpoints, pred_target_speed
+
+    if getattr(self, 'collision_prediction_control_mode', 'direction_aware') == 'simple_stop':
+      return pred_checkpoints, 0.0
 
     direction = str(collision_result.get('direction', '')).upper().replace('BACK', 'REAR')
     max_target_speed = self._maximum_collision_target_speed()
