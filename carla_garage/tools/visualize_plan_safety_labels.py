@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,15 @@ CLASS_COLORS = [
     np.array([250, 160, 160]),  # stop sign
     np.array([16, 133, 133]),  # emergency vehicle
 ]
+DATASET_BOX_CLASS_IDS = {
+    "car": 0,
+    "walker": 1,
+    "traffic_light": 2,
+    "stop_sign": 3,
+    "emergency_vehicle": 4,
+    "static": 0,
+}
+DATASET_BOX_CLASSES = set(DATASET_BOX_CLASS_IDS)
 EGO_COLOR = (0, 220, 255)
 FUTURE_EGO_COLOR = (255, 215, 0)
 TARGET_POINT_COLOR = (255, 0, 255)
@@ -162,6 +172,72 @@ def load_measurement(route_dir: Path, frame: str) -> dict | None:
   return None
 
 
+def normalize_angle(angle: float) -> float:
+  return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def yaw_from_matrix(matrix: np.ndarray) -> float:
+  return math.atan2(float(matrix[1, 0]), float(matrix[0, 0]))
+
+
+def actor_box_to_ego(origin_matrix: np.ndarray, actor: dict) -> np.ndarray | None:
+  actor_class = str(actor.get("class", "actor"))
+  if actor_class == "ego_car" or actor_class not in DATASET_BOX_CLASSES:
+    return None
+
+  matrix_raw = actor.get("matrix")
+  extent_raw = actor.get("extent")
+  if matrix_raw is None or not isinstance(extent_raw, list) or len(extent_raw) < 2:
+    return None
+
+  try:
+    actor_matrix = np.array(matrix_raw, dtype=np.float64)
+    relative_matrix = np.linalg.inv(origin_matrix) @ actor_matrix
+    extent_x = float(extent_raw[0])
+    extent_y = float(extent_raw[1])
+    speed = float(actor.get("speed", 0.0) or 0.0)
+    brake = float(actor.get("brake", 0.0) or 0.0)
+  except (TypeError, ValueError, np.linalg.LinAlgError):
+    return None
+
+  yaw = normalize_angle(yaw_from_matrix(actor_matrix) - yaw_from_matrix(origin_matrix))
+  class_id = DATASET_BOX_CLASS_IDS.get(actor_class, 0)
+  return np.array(
+      [
+          float(relative_matrix[0, 3]),
+          float(relative_matrix[1, 3]),
+          extent_x,
+          extent_y,
+          yaw,
+          speed,
+          brake,
+          float(class_id),
+      ],
+      dtype=np.float32,
+  )
+
+
+def load_dataset_boxes(route_dir: Path, frame: str, measurement: dict | None) -> list[np.ndarray]:
+  if measurement is None or measurement.get("ego_matrix") is None:
+    return []
+
+  boxes_path = route_dir / "boxes" / f"{int(frame):04}.json.gz"
+  if not boxes_path.is_file():
+    return []
+
+  try:
+    origin_matrix = np.array(measurement["ego_matrix"], dtype=np.float64)
+  except (TypeError, ValueError):
+    return []
+
+  boxes = []
+  for actor in load_json_gz(boxes_path):
+    box = actor_box_to_ego(origin_matrix, actor)
+    if box is not None:
+      boxes.append(box)
+  return boxes
+
+
 def ego_to_image_point(x: float, y: float, pixels_per_meter: float, min_y: float,
                        max_x: float) -> tuple[int, int]:
   col = int((y - min_y) * pixels_per_meter)
@@ -269,9 +345,23 @@ def draw_box(image: np.ndarray, box: np.ndarray, color: tuple[int, int, int], th
   image[...] = np.array(pil_image)
 
 
+def draw_actor_boxes(image: np.ndarray, boxes: list, pixels_per_meter: float, min_y: float, max_x: float,
+                     thickness: int = 3) -> None:
+  for box in boxes:
+    box = np.asarray(box, dtype=np.float32).copy()
+    if len(box) < 5:
+      continue
+    class_id = int(box[7]) if len(box) > 7 else 0
+    color = CLASS_COLORS[class_id % len(CLASS_COLORS)].copy()
+    if len(box) > 6:
+      color[1] = color[1] * (1.0 - float(box[6]))
+    draw_box(image, box, color=tuple(int(channel) for channel in color), thickness=thickness,
+             pixels_per_meter=pixels_per_meter, min_y=min_y, max_x=max_x)
+
+
 def render_frame(route_dir: Path, labels: dict, frame: str, candidate_index: int, output_dir: Path,
                  scale_factor: int, pixels_per_meter: float, min_x: float, max_x: float, min_y: float,
-                 max_y: float, use_ground_plane: bool) -> Path:
+                 max_y: float, use_ground_plane: bool, show_dataset_boxes: bool) -> Path:
   candidates = labels["frames"][frame]
   candidate = candidates[candidate_index]
 
@@ -287,20 +377,16 @@ def render_frame(route_dir: Path, labels: dict, frame: str, candidate_index: int
   draw_box(image, ego_box, color=EGO_COLOR, thickness=4, pixels_per_meter=loc_pixels_per_meter, min_y=min_y,
            max_x=max_x)
 
-  for box in candidate.get("other_boxes", []):
-    box = np.asarray(box, dtype=np.float32).copy()
-    class_id = int(box[7]) if len(box) > 7 else 0
-    color = CLASS_COLORS[class_id % len(CLASS_COLORS)].copy()
-    if len(box) > 6:
-      color[1] = color[1] * (1.0 - float(box[6]))
-    draw_box(image, box, color=tuple(int(channel) for channel in color), thickness=3,
-             pixels_per_meter=loc_pixels_per_meter, min_y=min_y, max_x=max_x)
+  measurement = load_measurement(route_dir, frame)
+  if show_dataset_boxes:
+    draw_actor_boxes(image, load_dataset_boxes(route_dir, frame, measurement), loc_pixels_per_meter, min_y, max_x)
+  if candidate.get("other_boxes"):
+    draw_actor_boxes(image, candidate.get("other_boxes", []), loc_pixels_per_meter, min_y, max_x)
 
   unsafe = is_unsafe_candidate(candidate, labels)
   path_color = (0, 0, 255) if unsafe else (0, 200, 0)
   draw_waypoints(image, candidate.get("waypoints", []), path_color, loc_pixels_per_meter, min_y, max_x)
 
-  measurement = load_measurement(route_dir, frame)
   draw_future_ego_rollout(image, candidate, measurement, ego_extent, float(labels.get("dt", DEFAULT_DT)),
                           loc_pixels_per_meter, min_y, max_x)
   if measurement is not None:
@@ -410,6 +496,7 @@ def render_route(route_dir: Path, args: argparse.Namespace) -> int:
           min_y=args.min_y,
           max_y=args.max_y,
           use_ground_plane=args.use_ground_plane,
+          show_dataset_boxes=not args.no_dataset_boxes,
       )
       print(output_path)
       rendered += 1
@@ -438,6 +525,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--min-y", type=float, default=-32.0)
   parser.add_argument("--max-y", type=float, default=32.0)
   parser.add_argument("--use-ground-plane", action="store_true", help="Use below+above channels when building BEV.")
+  parser.add_argument("--no-dataset-boxes", action="store_true", help="Do not draw boxes loaded from route boxes/*.json.gz.")
   return parser.parse_args()
 
 

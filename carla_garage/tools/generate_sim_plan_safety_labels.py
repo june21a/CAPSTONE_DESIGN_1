@@ -44,6 +44,15 @@ MAX_CHECKED_FRAMES_BEFORE_EVENT = 10
 DEFAULT_COLLISION_FRAME_FUTURE_WINDOW = 5
 DEFAULT_NONZERO_STEER_THRESHOLD = 1e-3
 COLLISION_REGION_EGO_BOX_SAMPLE_SPACING = 0.5
+MAX_CHECKED_FRAMES_AFTER_EVENT = 0
+FRONT_OBJECT_MAX_DISTANCE = 20.0
+FRONT_OBJECT_LATERAL_MARGIN = 0.75
+COLLISION_CHECK_CLASSES = {"car", "walker", "static", "traffic_light", "stop_sign"}
+COLLISION_KEY_CLASSES = {
+    "collisions_vehicle": {"car"},
+    "collisions_pedestrian": {"walker"},
+    "collisions_layout": {"static", "traffic_light", "stop_sign"},
+}
 
 
 def load_json_gz(path: Path) -> Any:
@@ -206,7 +215,115 @@ def deduplicate_collision_events(events: list[dict[str, Any]]) -> list[dict[str,
     return resolved + unresolved
 
 
+def collision_classes_from_results(results: dict[str, Any] | None) -> set[str]:
+    if results is None:
+        return set(COLLISION_CHECK_CLASSES)
+
+    classes: set[str] = set()
+    infractions = results.get("infractions", {})
+    for key, key_classes in COLLISION_KEY_CLASSES.items():
+        if infractions.get(key):
+            classes.update(key_classes)
+    return classes or set(COLLISION_CHECK_CLASSES)
+
+
+def actor_world_box(actor: dict[str, Any]) -> dict[str, Any] | None:
+    matrix_raw = actor.get("matrix")
+    extent_raw = actor.get("extent")
+    if matrix_raw is None or not isinstance(extent_raw, list) or len(extent_raw) < 2:
+        return None
+
+    try:
+        matrix = np.array(matrix_raw, dtype=np.float64)
+        extent = np.array([float(extent_raw[0]), float(extent_raw[1])], dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+
+    return {
+        "class": str(actor.get("class", "actor")),
+        "id": actor.get("id"),
+        "center": matrix[:2, 3].astype(np.float64),
+        "extent": extent,
+        "yaw": yaw_from_matrix(matrix),
+    }
+
+
+def first_logged_ego_actor_overlap(
+    boxes: list[dict[str, Any]],
+    allowed_actor_classes: set[str],
+) -> tuple[dict[str, Any] | None, int]:
+    ego_box = None
+    other_boxes = []
+    for actor in boxes:
+        actor_class = str(actor.get("class", "actor"))
+        box = actor_world_box(actor)
+        if box is None:
+            continue
+        if actor_class == "ego_car":
+            ego_box = box
+        elif actor_class in allowed_actor_classes:
+            other_boxes.append(box)
+
+    if ego_box is None:
+        return None, len(other_boxes)
+
+    ego_corners = obb_corners(ego_box["center"], ego_box["extent"], ego_box["yaw"])
+    for actor_box in other_boxes:
+        actor_corners = obb_corners(actor_box["center"], actor_box["extent"], actor_box["yaw"])
+        if polygons_overlap(ego_corners, actor_corners):
+            return {
+                "class": actor_box["class"],
+                "id": actor_box["id"],
+                "center": actor_box["center"].round(4).tolist(),
+                "extent": actor_box["extent"].round(4).tolist(),
+                "yaw": round(float(actor_box["yaw"]), 4),
+            }, len(other_boxes)
+    return None, len(other_boxes)
+
+
+def infer_collision_data_frames_from_logged_box_overlaps(
+    route_dir: Path,
+    paths: list[Path],
+    allowed_actor_classes: set[str],
+) -> list[dict[str, Any]]:
+    events = []
+    in_overlap_run = False
+    for path in paths:
+        frame = int(path.stem.split(".")[0])
+        boxes_path = route_dir / "boxes" / f"{frame:04}.json.gz"
+        if not boxes_path.is_file():
+            in_overlap_run = False
+            continue
+
+        try:
+            boxes = load_json_gz(boxes_path)
+        except (OSError, EOFError, json.JSONDecodeError):
+            in_overlap_run = False
+            continue
+
+        overlapped_actor, checked_actor_count = first_logged_ego_actor_overlap(boxes, allowed_actor_classes)
+        if overlapped_actor is None:
+            in_overlap_run = False
+            continue
+        if in_overlap_run:
+            continue
+
+        events.append({
+            "frame": frame,
+            "source": "logged_box_ego_actor_overlap",
+            "location_distance": None,
+            "location_index": None,
+            "location": None,
+            "overlapped_actor": overlapped_actor,
+            "checked_actor_count": checked_actor_count,
+            "allowed_actor_classes": sorted(allowed_actor_classes),
+        })
+        in_overlap_run = True
+    return events
+
+
 def collision_data_events(
+    route_dir: Path,
     results: dict[str, Any] | None,
     paths: list[Path],
     measurements: list[dict[str, Any]],
@@ -242,6 +359,13 @@ def collision_data_events(
                 "location_index": None,
                 "location": None,
             })
+            
+    if not events and has_collision_result(results):
+        events.extend(infer_collision_data_frames_from_logged_box_overlaps(
+            route_dir,
+            paths,
+            collision_classes_from_results(results),
+        ))
 
     if infer_from_location:
         events.extend(infer_collision_data_frames_from_locations(
@@ -266,6 +390,14 @@ def delete_existing_plan_safety_labels(route_dirs: list[Path]) -> int:
             labels_path.unlink()
             deleted += 1
     return deleted
+
+
+def remove_existing_label_if_present(route_dir: Path) -> bool:
+    labels_path = route_dir / "plan_safety_labels.json.gz"
+    if not labels_path.is_file():
+        return False
+    labels_path.unlink()
+    return True
 
 
 def focus_frame(measurement: dict[str, Any], all_frames: bool) -> bool:
@@ -453,6 +585,176 @@ def ego_box_intersects_circle(
     return distance <= max(0.0, float(radius))
 
 
+def obb_corners(center: np.ndarray, extent: np.ndarray, yaw: float) -> np.ndarray:
+    cos_yaw = math.cos(yaw)
+    sin_yaw = math.sin(yaw)
+    rotation = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]], dtype=np.float64)
+    local_corners = np.array(
+        [[extent[0], extent[1]], [extent[0], -extent[1]], [-extent[0], -extent[1]], [-extent[0], extent[1]]],
+        dtype=np.float64,
+    )
+    return center[:2] + local_corners @ rotation.T
+
+
+def polygons_overlap(corners_a: np.ndarray, corners_b: np.ndarray) -> bool:
+    for corners in (corners_a, corners_b):
+        for index in range(4):
+            edge = corners[(index + 1) % 4] - corners[index]
+            axis = np.array([-edge[1], edge[0]], dtype=np.float64)
+            norm = float(np.linalg.norm(axis))
+            if norm < 1e-6:
+                continue
+            axis /= norm
+            projection_a = corners_a @ axis
+            projection_b = corners_b @ axis
+            if projection_a.max() < projection_b.min() or projection_b.max() < projection_a.min():
+                return False
+    return True
+
+
+def actor_box_in_origin(origin_matrix: np.ndarray, actor: dict[str, Any]) -> dict[str, Any] | None:
+    actor_class = str(actor.get("class", "actor"))
+    if actor_class == "ego_car" or actor_class not in COLLISION_CHECK_CLASSES:
+        return None
+
+    pose = actor_pose_in_origin(origin_matrix, actor)
+    extent = actor.get("extent")
+    if pose is None or not isinstance(extent, list) or len(extent) < 2:
+        return None
+
+    try:
+        return {
+            "class": actor_class,
+            "center": np.array([float(pose[0]), float(pose[1])], dtype=np.float64),
+            "yaw": float(pose[2]),
+            "extent": np.array([float(extent[0]), float(extent[1])], dtype=np.float64),
+            "id": actor.get("id"),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def interpolate_pose_along_waypoints(waypoints: list[Any], distance: float) -> tuple[np.ndarray, float, float]:
+    points = path_points_from_waypoints(waypoints)
+    if len(points) == 0:
+        return np.zeros(2, dtype=np.float64), 0.0, 0.0
+    if len(points) == 1:
+        return points[0].astype(np.float64), 0.0, 0.0
+
+    target_distance = max(0.0, float(distance))
+    cumulative_distance = 0.0
+    last_yaw = 0.0
+    for index in range(len(points) - 1):
+        start = points[index]
+        end = points[index + 1]
+        segment = end - start
+        segment_length = float(np.linalg.norm(segment))
+        if segment_length < 1e-6:
+            continue
+
+        yaw = math.atan2(float(segment[1]), float(segment[0]))
+        last_yaw = yaw
+        if cumulative_distance + segment_length >= target_distance:
+            ratio = (target_distance - cumulative_distance) / segment_length
+            return start + segment * ratio, yaw, target_distance
+        cumulative_distance += segment_length
+
+    return points[-1].astype(np.float64), last_yaw, cumulative_distance
+
+
+def ego_rollout_pose_for_future_frame(
+    waypoints: list[Any],
+    current_speed: float,
+    target_speed: float,
+    frame_offset: int,
+    data_save_freq: int,
+    sim_fps: float,
+    max_acceleration: float,
+    max_deceleration: float,
+    rollout_dt: float,
+) -> tuple[np.ndarray, float, float, float, float]:
+    horizon_seconds = max(0, int(frame_offset)) * max(1, int(data_save_freq)) / max(float(sim_fps), 1e-6)
+    rollout_distance, future_speed = velocity_rollout_distance_and_speed(
+        current_speed,
+        target_speed,
+        horizon_seconds,
+        max_acceleration,
+        max_deceleration,
+        rollout_dt,
+    )
+    position, yaw, path_distance = interpolate_pose_along_waypoints(waypoints, rollout_distance)
+    return position, yaw, path_distance, horizon_seconds, future_speed
+
+
+def future_logged_box_overlap(
+    route_dir: Path,
+    origin_matrix: np.ndarray,
+    future_frame: int,
+    ego_position: np.ndarray,
+    ego_yaw: float,
+    ego_extent: list[float] | np.ndarray | None,
+) -> tuple[bool, dict[str, Any] | None, int]:
+    boxes_path = route_dir / "boxes" / f"{future_frame:04}.json.gz"
+    if not boxes_path.is_file():
+        return False, None, 0
+
+    extent = normalize_ego_extent(ego_extent)
+    ego_corners = obb_corners(ego_position.astype(np.float64), extent, ego_yaw)
+    checked_actor_count = 0
+    for actor in load_json_gz(boxes_path):
+        actor_box = actor_box_in_origin(origin_matrix, actor)
+        if actor_box is None:
+            continue
+        checked_actor_count += 1
+        actor_corners = obb_corners(actor_box["center"], actor_box["extent"], actor_box["yaw"])
+        if polygons_overlap(ego_corners, actor_corners):
+            detail = {
+                "class": actor_box["class"],
+                "id": actor_box["id"],
+                "center": actor_box["center"].round(4).tolist(),
+                "extent": actor_box["extent"].round(4).tolist(),
+                "yaw": round(float(actor_box["yaw"]), 4),
+            }
+            return True, detail, checked_actor_count
+
+    return False, None, checked_actor_count
+
+
+def object_in_front(
+    route_dir: Path,
+    origin_matrix: np.ndarray,
+    frame: int,
+    ego_extent: list[float] | np.ndarray | None,
+    max_distance: float = FRONT_OBJECT_MAX_DISTANCE,
+    lateral_margin: float = FRONT_OBJECT_LATERAL_MARGIN,
+) -> tuple[bool, dict[str, Any] | None, int]:
+    boxes_path = route_dir / "boxes" / f"{frame:04}.json.gz"
+    if not boxes_path.is_file():
+        return False, None, 0
+
+    ego = normalize_ego_extent(ego_extent)
+    checked_actor_count = 0
+    for actor in load_json_gz(boxes_path):
+        actor_box = actor_box_in_origin(origin_matrix, actor)
+        if actor_box is None:
+            continue
+        checked_actor_count += 1
+        center = actor_box["center"]
+        longitudinal_gap = float(center[0] - ego[0] - actor_box["extent"][0])
+        lateral_limit = float(ego[1] + actor_box["extent"][1] + lateral_margin)
+        if 0.0 <= longitudinal_gap <= max_distance and abs(float(center[1])) <= lateral_limit:
+            return True, {
+                "class": actor_box["class"],
+                "id": actor_box["id"],
+                "center": center.round(4).tolist(),
+                "extent": actor_box["extent"].round(4).tolist(),
+                "longitudinal_gap": round(longitudinal_gap, 4),
+                "lateral_limit": round(lateral_limit, 4),
+            }, checked_actor_count
+
+    return False, None, checked_actor_count
+
+
 def path_distance_to_region(
     points: np.ndarray,
     center: np.ndarray,
@@ -538,6 +840,25 @@ def velocity_rollout_distance(
     max_deceleration: float,
     rollout_dt: float,
 ) -> float:
+    distance, _ = velocity_rollout_distance_and_speed(
+        current_speed,
+        target_speed,
+        horizon_seconds,
+        max_acceleration,
+        max_deceleration,
+        rollout_dt,
+    )
+    return distance
+
+
+def velocity_rollout_distance_and_speed(
+    current_speed: float,
+    target_speed: float,
+    horizon_seconds: float,
+    max_acceleration: float,
+    max_deceleration: float,
+    rollout_dt: float,
+) -> tuple[float, float]:
     speed = max(0.0, float(current_speed))
     target_speed = max(0.0, float(target_speed))
     remaining_time = max(0.0, float(horizon_seconds))
@@ -557,12 +878,12 @@ def velocity_rollout_distance(
         speed = next_speed
         remaining_time -= step_dt
 
-    return distance
+    return distance, speed
 
 
 def evaluate_collision_reachability(
+    route_dir: Path,
     measurement: dict[str, Any],
-    collision_measurement: dict[str, Any] | None,
     frame: int,
     collision_frame: int | None,
     pred_len: int,
@@ -571,84 +892,225 @@ def evaluate_collision_reachability(
     max_acceleration: float,
     max_deceleration: float,
     rollout_dt: float,
-    collision_region_radius: float,
     ego_extent: list[float] | np.ndarray | None,
     max_checked_frames_before_event: int = MAX_CHECKED_FRAMES_BEFORE_EVENT,
 ) -> tuple[bool, dict[str, Any]]:
     current_speed = speed_mps(measurement, "speed")
     target_speed = speed_mps(measurement, "target_speed")
     waypoints, plan_waypoint_source = plan_waypoints_from_measurement(measurement, pred_len)
-    straight_rollout = straight_waypoint_rollout(waypoints)
     detail: dict[str, Any] = {
         "current_speed": round(current_speed, 4),
         "target_speed": round(target_speed, 4),
         "plan_waypoint_source": plan_waypoint_source,
-        "straight_waypoint_rollout": straight_rollout,
-        "collision_region_overlap_test": "ego_box_circle",
+        "ego_rollout_model": "interpolated_waypoint_polyline_constant_target_speed_with_accel_limits",
+        "max_acceleration": round(float(max_acceleration), 4),
+        "max_deceleration": round(float(max_deceleration), 4),
+        "rollout_dt": round(float(rollout_dt), 4),
+        "collision_region_overlap_test": "future_logged_actor_obb",
         "ego_extent": normalize_ego_extent(ego_extent).round(4).tolist(),
-        "ego_box_sample_spacing": COLLISION_REGION_EGO_BOX_SAMPLE_SPACING,
         "collision_case_outside_checked_window": False,
         "collision_case_unsafe": False,
-        "collision_distance": None,
         "time_to_collision": None,
-        "intersects_future_collision_region": False,
-        "reachable_before_collision": False,
-        "unsafe_requires_non_straight_waypoints": True,
-        "suppressed_unsafe_straight_waypoint_rollout": False,
-        "distance_to_collision_region_along_rollout": None,
-        "reachable_distance_before_collision": None,
+        "future_frame_offset": None,
+        "ego_rollout_distance": None,
+        "ego_rollout_future_speed": None,
+        "ego_rollout_path_distance": None,
+        "ego_rollout_position": None,
+        "ego_rollout_yaw": None,
+        "overlaps_future_logged_object": False,
+        "overlapped_actor": None,
+        "checked_actor_count": 0,
     }
 
-    if collision_frame is None or collision_measurement is None or frame >= collision_frame:
+    if collision_frame is None or frame >= collision_frame:
         return False, detail
 
     if collision_frame - frame > max_checked_frames_before_event:
         detail["collision_case_outside_checked_window"] = True
         return False, detail
 
-    collision_point = collision_point_in_ego(measurement, collision_measurement)
-    if collision_point is None:
+    ego_matrix_raw = measurement.get("ego_matrix")
+    if ego_matrix_raw is None:
         return False, detail
 
-    collision_distance = float(np.linalg.norm(collision_point))
-    time_to_collision = (collision_frame - frame) * max(1, int(data_save_freq)) / max(sim_fps, 1e-6)
-    detail["collision_distance"] = round(collision_distance, 4)
-    detail["time_to_collision"] = round(time_to_collision, 4)
-
-    points = path_points_from_waypoints(waypoints)
-    distance_to_region = path_distance_to_region(
-        points,
-        collision_point,
-        max(0.0, collision_region_radius),
-        ego_extent,
-    )
-    if distance_to_region is None:
+    try:
+        origin_matrix = np.array(ego_matrix_raw, dtype=np.float64)
+    except (TypeError, ValueError):
         return False, detail
-    
-    reachable_distance = velocity_rollout_distance(
+
+    future_frame_offset = collision_frame - frame
+    ego_position, ego_yaw, path_distance, time_to_collision, future_speed = ego_rollout_pose_for_future_frame(
+        waypoints,
         current_speed,
         target_speed,
-        time_to_collision,
+        future_frame_offset,
+        data_save_freq,
+        sim_fps,
         max_acceleration,
         max_deceleration,
         rollout_dt,
     )
-    detail["intersects_future_collision_region"] = True
-    detail["distance_to_collision_region_along_rollout"] = round(distance_to_region, 4)
-    detail["reachable_distance_before_collision"] = round(reachable_distance, 4)
-    detail["reachable_before_collision"] = reachable_distance >= distance_to_region
-    unsafe = bool(detail["reachable_before_collision"] and not straight_rollout)
-    detail["collision_case_unsafe"] = unsafe
-    detail["suppressed_unsafe_straight_waypoint_rollout"] = bool(
-        detail["reachable_before_collision"] and straight_rollout
+    overlaps, overlapped_actor, checked_actor_count = future_logged_box_overlap(
+        route_dir,
+        origin_matrix,
+        collision_frame,
+        ego_position,
+        ego_yaw,
+        ego_extent,
     )
+    detail["time_to_collision"] = round(time_to_collision, 4)
+    detail["future_frame_offset"] = future_frame_offset
+    detail["ego_rollout_distance"] = round(
+        velocity_rollout_distance(
+            current_speed,
+            target_speed,
+            time_to_collision,
+            max_acceleration,
+            max_deceleration,
+            rollout_dt,
+        ),
+        4,
+    )
+    detail["ego_rollout_future_speed"] = round(float(future_speed), 4)
+    detail["ego_rollout_path_distance"] = round(path_distance, 4)
+    detail["ego_rollout_position"] = ego_position.round(4).tolist()
+    detail["ego_rollout_yaw"] = round(float(ego_yaw), 4)
+    detail["overlaps_future_logged_object"] = bool(overlaps)
+    detail["overlapped_actor"] = overlapped_actor
+    detail["checked_actor_count"] = checked_actor_count
+    unsafe = bool(overlaps)
+    detail["collision_case_unsafe"] = unsafe
     return unsafe, detail
 
 
+def evaluate_post_collision_control(
+    route_dir: Path,
+    measurement: dict[str, Any],
+    frame: int,
+    collision_frame: int,
+    pred_len: int,
+    data_save_freq: int,
+    sim_fps: float,
+    max_acceleration: float,
+    max_deceleration: float,
+    rollout_dt: float,
+    ego_extent: list[float] | np.ndarray | None,
+) -> tuple[bool, dict[str, Any]]:
+    current_speed = speed_mps(measurement, "speed")
+    target_speed = speed_mps(measurement, "target_speed")
+    waypoints, plan_waypoint_source = plan_waypoints_from_measurement(measurement, pred_len)
+    trying_to_accelerate = target_speed > current_speed + 1e-3
+    frame_offset = frame - collision_frame
+    detail: dict[str, Any] = {
+        "post_collision_control_check": True,
+        "post_collision_frame_offset": frame_offset,
+        "current_speed": round(current_speed, 4),
+        "target_speed": round(target_speed, 4),
+        "plan_waypoint_source": plan_waypoint_source,
+        "ego_rollout_model": "interpolated_waypoint_polyline_constant_target_speed_with_accel_limits",
+        "collision_region_overlap_test": "future_logged_actor_obb",
+        "trying_to_accelerate": bool(trying_to_accelerate),
+        "object_in_front": False,
+        "front_object": None,
+        "front_object_checked_actor_count": 0,
+        "front_object_max_distance": FRONT_OBJECT_MAX_DISTANCE,
+        "front_object_lateral_margin": FRONT_OBJECT_LATERAL_MARGIN,
+        "post_collision_future_overlap_check": True,
+        "post_collision_future_overlap_horizon": max(0, int(pred_len)),
+        "post_collision_future_overlap_frame": None,
+        "post_collision_future_overlap_offset": None,
+        "post_collision_future_overlap_actor": None,
+        "post_collision_future_overlap_checked_frame_count": 0,
+        "post_collision_future_overlap_checked_actor_count": 0,
+        "post_collision_target_rule_unsafe": False,
+        "post_collision_collision_possible": False,
+        "collision_case_unsafe": False,
+    }
+
+    ego_matrix_raw = measurement.get("ego_matrix")
+    if ego_matrix_raw is None:
+        return False, detail
+
+    try:
+        origin_matrix = np.array(ego_matrix_raw, dtype=np.float64)
+    except (TypeError, ValueError):
+        return False, detail
+
+    has_front_object, front_object, checked_actor_count = object_in_front(
+        route_dir,
+        origin_matrix,
+        frame,
+        ego_extent,
+    )
+    target_rule_unsafe = (trying_to_accelerate and has_front_object) or (not trying_to_accelerate and not has_front_object)
+    detail["object_in_front"] = bool(has_front_object)
+    detail["front_object"] = front_object
+    detail["front_object_checked_actor_count"] = checked_actor_count
+    detail["post_collision_target_rule_unsafe"] = bool(target_rule_unsafe)
+
+    collision_possible = False
+    total_checked_actor_count = 0
+    checked_frame_count = 0
+    for future_offset in range(1, max(0, int(pred_len)) + 1):
+        future_frame = frame + future_offset
+        ego_position, ego_yaw, path_distance, horizon_seconds, future_speed = ego_rollout_pose_for_future_frame(
+            waypoints,
+            current_speed,
+            target_speed,
+            future_offset,
+            data_save_freq,
+            sim_fps,
+            max_acceleration,
+            max_deceleration,
+            rollout_dt,
+        )
+        overlaps, overlapped_actor, overlap_checked_actor_count = future_logged_box_overlap(
+            route_dir,
+            origin_matrix,
+            future_frame,
+            ego_position,
+            ego_yaw,
+            ego_extent,
+        )
+        checked_frame_count += 1
+        total_checked_actor_count += overlap_checked_actor_count
+        if not overlaps:
+            continue
+
+        collision_possible = True
+        detail["post_collision_future_overlap_frame"] = future_frame
+        detail["post_collision_future_overlap_offset"] = future_offset
+        detail["post_collision_future_overlap_actor"] = overlapped_actor
+        detail["time_to_collision"] = round(horizon_seconds, 4)
+        detail["ego_rollout_distance"] = round(
+            velocity_rollout_distance(
+                current_speed,
+                target_speed,
+                horizon_seconds,
+                max_acceleration,
+                max_deceleration,
+                rollout_dt,
+            ),
+            4,
+        )
+        detail["ego_rollout_future_speed"] = round(float(future_speed), 4)
+        detail["ego_rollout_path_distance"] = round(path_distance, 4)
+        detail["ego_rollout_position"] = ego_position.round(4).tolist()
+        detail["ego_rollout_yaw"] = round(float(ego_yaw), 4)
+        break
+
+    detail["post_collision_future_overlap_checked_frame_count"] = checked_frame_count
+    detail["post_collision_future_overlap_checked_actor_count"] = total_checked_actor_count
+    detail["post_collision_collision_possible"] = bool(collision_possible)
+    unsafe = bool(collision_possible or target_rule_unsafe)
+    detail["collision_case_unsafe"] = bool(unsafe)
+    return bool(unsafe), detail
+
+
 def evaluate_collision_events_reachability(
+    route_dir: Path,
     measurement: dict[str, Any],
     collision_events: list[dict[str, Any]],
-    frame_to_measurement: dict[int, dict[str, Any]],
     frame: int,
     pred_len: int,
     data_save_freq: int,
@@ -656,8 +1118,6 @@ def evaluate_collision_events_reachability(
     max_acceleration: float,
     max_deceleration: float,
     rollout_dt: float,
-    default_collision_region_radius: float,
-    collision_region_radii: dict[int, float],
     default_ego_extent: list[float] | np.ndarray | None,
     ego_extents: dict[int, list[float]],
     collision_frame_future_window: int,
@@ -678,22 +1138,14 @@ def evaluate_collision_events_reachability(
             if frame >= collision_measurement_frame:
                 continue
 
-            collision_measurement = frame_to_measurement.get(collision_measurement_frame)
-            if collision_measurement is None:
-                continue
-
             checked_count += 1
-            collision_region_radius = collision_region_radii.get(
-                collision_measurement_frame,
-                collision_region_radii.get(collision_frame, default_collision_region_radius),
-            )
             ego_extent = ego_extents.get(
                 collision_measurement_frame,
                 ego_extents.get(collision_frame, default_ego_extent),
             )
             unsafe, detail = evaluate_collision_reachability(
+                route_dir,
                 measurement,
-                collision_measurement,
                 frame,
                 collision_measurement_frame,
                 pred_len,
@@ -702,7 +1154,6 @@ def evaluate_collision_events_reachability(
                 max_acceleration,
                 max_deceleration,
                 rollout_dt,
-                collision_region_radius,
                 ego_extent,
             )
             detail["collision_event_index"] = event_index
@@ -728,8 +1179,8 @@ def evaluate_collision_events_reachability(
         return False, best_safe_detail
 
     _, detail = evaluate_collision_reachability(
+        route_dir,
         measurement,
-        None,
         frame,
         None,
         pred_len,
@@ -738,7 +1189,6 @@ def evaluate_collision_events_reachability(
         max_acceleration,
         max_deceleration,
         rollout_dt,
-        default_collision_region_radius,
         default_ego_extent,
     )
     detail["collision_event_index"] = None
@@ -796,9 +1246,17 @@ def select_safe_frame_keys(
     if safe_limit == 0:
         return set(), "none_safe_limit_zero", safe_limit
 
-    if prefer_steering_safe and steering_safe_frame_keys:
-        selected_count = min(safe_limit, len(steering_safe_frame_keys))
-        return set(rng.sample(steering_safe_frame_keys, selected_count)), "consecutive_nonzero_steer", safe_limit
+    if steering_safe_frame_keys:
+        selected_steering_count = min(safe_limit, len(steering_safe_frame_keys))
+        selected = set(rng.sample(steering_safe_frame_keys, selected_steering_count))
+        remaining_limit = safe_limit - len(selected)
+        if remaining_limit > 0:
+            remaining_safe = [frame_key for frame_key in safe_frame_keys if frame_key not in selected]
+            selected.update(rng.sample(remaining_safe, min(remaining_limit, len(remaining_safe))))
+        selected_source = "nonzero_steer_first"
+        if prefer_steering_safe:
+            selected_source = "consecutive_nonzero_steer_first"
+        return selected, selected_source, safe_limit
 
     selected_source = "random_safe_fallback_no_steering_safe" if prefer_steering_safe else "random_safe"
     return set(rng.sample(safe_frame_keys, safe_limit)), selected_source, safe_limit
@@ -1019,8 +1477,10 @@ def render_dataset_trajectory_visualization(
         waypoint_count = len(display_candidate.get("waypoints") or pred_waypoints)
         display_candidate["waypoints"] = pred_waypoints[:waypoint_count]
         display_candidate["plan_waypoint_source"] = "pred_waypoints"
-    elif display_candidate.get("plan_waypoint_source") != "pred_waypoints":
+    elif not display_candidate.get("waypoints"):
         return None
+    waypoint_source = str(display_candidate.get("plan_waypoint_source", "waypoints"))
+    waypoint_source_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", waypoint_source).strip("_") or "waypoints"
 
     width = max(1, int(round((max_y - min_y) * pixels_per_meter)))
     height = max(1, int(round((max_x - min_x) * pixels_per_meter)))
@@ -1036,8 +1496,8 @@ def render_dataset_trajectory_visualization(
 
     label = "unsafe" if any(unsafe_candidate(candidate, unsafe_label) for candidate in candidates) else "safe"
     title_color = (210, 30, 30) if label == "unsafe" else (20, 135, 55)
-    draw.text((8, 8), f"{frame_key} {label} pred_waypoints", fill=title_color)
-    draw.text((8, 24), "source=pred_waypoints", fill=(35, 35, 35))
+    draw.text((8, 8), f"{frame_key} {label} {waypoint_source}", fill=title_color)
+    draw.text((8, 24), f"source={waypoint_source}", fill=(35, 35, 35))
     target_speed_text, waypoint_text = candidate_status_text(display_candidate)
     draw.text((8, 40), target_speed_text, fill=(20, 20, 20))
     draw.text((8, 56), waypoint_text, fill=(20, 20, 20))
@@ -1045,7 +1505,7 @@ def render_dataset_trajectory_visualization(
         image = append_rgb_panel(image, route_dir, frame_key)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{frame_key}_{label}_pred_waypoints.png"
+    output_path = output_dir / f"{frame_key}_{label}_{waypoint_source_slug}.png"
     image.save(output_path)
     return output_path
 
@@ -1169,6 +1629,7 @@ def label_route(
     results = load_results(route_dir)
     collision = has_collision_result(results)
     collision_events = collision_data_events(
+        route_dir,
         results,
         paths,
         measurements,
@@ -1185,7 +1646,6 @@ def label_route(
     collision_frames = [int(event["frame"]) for event in resolved_collision_events]
     last_collision_frame = max(collision_frames) if collision_frames else None
     unresolved_collision = collision and not resolved_collision_events
-    frame_to_measurement = measurement_frame_map(paths, measurements)
     resolved_collision_region_radius, collision_region_radius_source, ego_extent = resolve_collision_region_radius(
         route_dir,
         paths,
@@ -1223,46 +1683,106 @@ def label_route(
     for path, measurement in zip(paths, measurements):
         frame_key = path.stem.split(".")[0]
         frame = int(frame_key)
-        if last_collision_frame is not None and frame > last_collision_frame + collision_frame_future_window:
+        post_collision_frames_end = last_collision_frame + MAX_CHECKED_FRAMES_AFTER_EVENT if last_collision_frame is not None else None
+        if post_collision_frames_end is not None and frame > post_collision_frames_end:
             continue
-        if not focus_frame(measurement, all_frames):
+        post_collision_event = None
+        for event in resolved_collision_events:
+            event_frame = int(event["frame"])
+            if 1 <= frame - event_frame <= MAX_CHECKED_FRAMES_AFTER_EVENT:
+                post_collision_event = event
+                break
+
+        force_keep = post_collision_event is not None
+        if not force_keep and not focus_frame(measurement, all_frames):
             continue
-        collision_unsafe, collision_detail = evaluate_collision_events_reachability(
-            measurement,
-            resolved_collision_events,
-            frame_to_measurement,
-            frame,
-            pred_len,
-            data_save_freq,
-            sim_fps,
-            max_acceleration,
-            max_deceleration,
-            rollout_dt,
-            resolved_collision_region_radius,
-            collision_region_radii,
-            ego_extent,
-            ego_extents_by_frame,
-            collision_frame_future_window,
-        )
+
+        if post_collision_event is not None:
+            post_collision_frame = int(post_collision_event["frame"])
+            post_collision_extent = ego_extents_by_frame.get(post_collision_frame, ego_extent)
+            collision_unsafe, collision_detail = evaluate_post_collision_control(
+                route_dir,
+                measurement,
+                frame,
+                post_collision_frame,
+                pred_len,
+                data_save_freq,
+                sim_fps,
+                max_acceleration,
+                max_deceleration,
+                rollout_dt,
+                post_collision_extent,
+            )
+            collision_detail["collision_event_index"] = resolved_collision_events.index(post_collision_event)
+            collision_detail["collision_event_count"] = len(resolved_collision_events)
+            collision_detail["collision_event_source"] = post_collision_event.get("source")
+            collision_detail["collision_event_location_distance"] = post_collision_event.get("location_distance")
+            collision_detail["collision_event_location_index"] = post_collision_event.get("location_index")
+            collision_detail["collision_event_frame"] = post_collision_frame
+            collision_detail["post_collision_label_forced_keep"] = True
+        else:
+            collision_unsafe, collision_detail = evaluate_collision_events_reachability(
+                route_dir,
+                measurement,
+                resolved_collision_events,
+                frame,
+                pred_len,
+                data_save_freq,
+                sim_fps,
+                max_acceleration,
+                max_deceleration,
+                rollout_dt,
+                ego_extent,
+                ego_extents_by_frame,
+                collision_frame_future_window,
+            )
         unsafe = collision_unsafe
         safety_detail = collision_detail
         steer = steer_value(measurement)
+        target_speed = speed_mps(measurement, "target_speed")
         nonzero_steer_run_length = nonzero_steer_run_lengths.get(frame_key, 0)
         safe_case_from_nonzero_steer_run = (
             safe_consecutive_nonzero_steer_frames > 0
             and nonzero_steer_run_length >= safe_consecutive_nonzero_steer_frames
         )
+        safe_case_from_nonzero_steer = abs(steer) > nonzero_steer_threshold
         safety_detail["steer"] = round(steer, 4)
         safety_detail["nonzero_steer_threshold"] = nonzero_steer_threshold
         safety_detail["nonzero_steer_run_length"] = nonzero_steer_run_length
         safety_detail["safe_case_from_consecutive_nonzero_steer"] = bool(safe_case_from_nonzero_steer_run)
+        safety_detail["safe_case_from_nonzero_steer"] = bool(safe_case_from_nonzero_steer)
+        safety_detail["safe_case_suppressed_zero_target_speed"] = bool(not unsafe and not force_keep and target_speed <= 1e-5)
+        safety_detail["force_keep_label"] = bool(force_keep)
         candidate = candidate_from_measurement(measurement, pred_len, unsafe, safety_detail)
-        candidate_frames.append((frame_key, candidate, unsafe))
+        candidate_frames.append((frame_key, candidate, unsafe, force_keep))
         unsafe_count += int(unsafe)
-        if not unsafe:
+        if not unsafe and (force_keep or target_speed > 1e-5):
             safe_frame_keys.append(frame_key)
-            if safe_case_from_nonzero_steer_run:
+            if safe_case_from_nonzero_steer or safe_case_from_nonzero_steer_run:
                 steering_safe_frame_keys.append(frame_key)
+
+    if unsafe_count == 0:
+        remove_existing_label_if_present(route_dir)
+        visualization_frames = {
+            frame_key: [candidate]
+            for frame_key, candidate, _, _ in candidate_frames
+        }
+        rendered_visualizations = maybe_render_route_trajectory_visualizations(
+            route_dir,
+            visualization_frames,
+            trajectory_visualization_output_dir,
+            trajectory_visualization_horizon,
+            trajectory_visualization_max_frames_per_route,
+            trajectory_visualization_unsafe_only,
+            trajectory_visualization_include_rgb,
+            0,
+            trajectory_visualization_pixels_per_meter,
+            trajectory_visualization_min_x,
+            trajectory_visualization_max_x,
+            trajectory_visualization_min_y,
+            trajectory_visualization_max_y,
+        )
+        return 0, 0, 0, unresolved_collision, False, rendered_visualizations
 
     route_seed = seed + sum(ord(char) for char in str(route_dir))
     selected_safe_frame_keys, selected_safe_source, safe_limit = select_safe_frame_keys(
@@ -1278,8 +1798,8 @@ def label_route(
 
     frames = {}
     safe_count = 0
-    for frame_key, candidate, unsafe in candidate_frames:
-        if not unsafe and frame_key not in selected_safe_frame_keys:
+    for frame_key, candidate, unsafe, force_keep in candidate_frames:
+        if not unsafe and not force_keep and frame_key not in selected_safe_frame_keys:
             continue
         frames[frame_key] = [candidate]
         safe_count += int(not unsafe)
@@ -1287,7 +1807,7 @@ def label_route(
     if not frames:
         visualization_frames = {
             frame_key: [candidate]
-            for frame_key, candidate, _ in candidate_frames
+            for frame_key, candidate, _, _ in candidate_frames
         }
         rendered_visualizations = maybe_render_route_trajectory_visualizations(
             route_dir,
@@ -1318,28 +1838,34 @@ def label_route(
         "collision_events": collision_events,
         "collision_event_count": len(resolved_collision_events),
         "collision_case_unsafe_criterion": (
-            "within_10_frames_before_each_collision_event_and_up_to_future_collision_frame_window_"
-            "future_collision_region_ego_box_overlap_and_velocity_rollout_reachability_"
-            "and_non_straight_waypoint_rollout"
+            "before_collision_interpolated_waypoint_constant_target_speed_ego_obb_overlap_with_logged_future_actor_"
+            "obb_and_after_collision_10_frame_future_logged_actor_obb_overlap_or_target_speed_front_object_rule"
         ),
         "max_checked_frames_before_event": MAX_CHECKED_FRAMES_BEFORE_EVENT,
+        "max_checked_frames_after_event": MAX_CHECKED_FRAMES_AFTER_EVENT,
         "collision_frame_future_window": collision_frame_future_window,
-        "straight_waypoint_max_lateral_spread": STRAIGHT_WAYPOINT_MAX_LATERAL_SPREAD,
-        "straight_waypoint_max_heading_change_deg": STRAIGHT_WAYPOINT_MAX_HEADING_CHANGE_DEG,
+        "ego_rollout_model": "interpolated_waypoint_polyline_constant_target_speed_with_accel_limits",
+        "collision_overlap_test": "oriented_bounding_box_overlap_against_logged_future_boxes",
+        "post_collision_control_rule": (
+            "future_logged_actor_obb_overlap_is_unsafe_or_accelerating_with_front_object_is_unsafe_"
+            "and_decelerating_or_zero_target_speed_without_front_object_is_unsafe"
+        ),
+        "front_object_max_distance": FRONT_OBJECT_MAX_DISTANCE,
+        "front_object_lateral_margin": FRONT_OBJECT_LATERAL_MARGIN,
+        "collision_check_classes": sorted(COLLISION_CHECK_CLASSES),
         "sim_fps": sim_fps,
         "data_save_freq": data_save_freq,
         "max_acceleration": max_acceleration,
         "max_deceleration": max_deceleration,
         "rollout_dt": rollout_dt,
-        "collision_region_radius": resolved_collision_region_radius,
-        "collision_region_radius_source": collision_region_radius_source,
-        "collision_region_radius_by_frame": collision_region_radii,
-        "collision_region_radius_source_by_frame": collision_region_radius_sources,
+        "legacy_collision_region_radius_unused": resolved_collision_region_radius,
+        "legacy_collision_region_radius_source_unused": collision_region_radius_source,
         "ego_extent": ego_extent,
         "ego_extent_by_frame": ego_extents_by_frame,
-        "ego_box_sample_spacing": COLLISION_REGION_EGO_BOX_SAMPLE_SPACING,
         "safe_samples_per_unsafe": safe_samples_per_unsafe,
         "max_safe_per_non_collision_route": max_safe_per_non_collision_route,
+        "safe_zero_target_speed_policy": "ordinary_safe_cases_are_not_collected_post_collision_forced_labels_are_kept",
+        "safe_selection_policy": "nonzero_steer_first_then_fill_with_remaining_safe_cases",
         "safe_consecutive_nonzero_steer_frames": safe_consecutive_nonzero_steer_frames,
         "nonzero_steer_threshold": nonzero_steer_threshold,
         "safe_candidate_count": len(safe_frame_keys),
@@ -1399,7 +1925,7 @@ def main() -> int:
     parser.add_argument(
         "--collision-region-radius",
         type=float,
-        default=0.5,
+        default=0.3,
         help=(
             "Optional radius in meters around the future collision pose treated as the collision region. "
             "Defaults to the ego_car extent from dataset boxes, falling back to the built-in ego extent."
@@ -1432,7 +1958,7 @@ def main() -> int:
     parser.add_argument(
         "--safe-samples-per-unsafe",
         type=float,
-        default=1.0,
+        default=3.0,
         help="For collision routes, save at most this many safe labels per unsafe label.",
     )
     parser.add_argument(
@@ -1460,7 +1986,12 @@ def main() -> int:
     parser.add_argument(
         "--no-infer-collision-frame-from-location",
         action="store_true",
-        help="Only use collision frame metadata; do not infer frame from collision location messages.",
+        help="Deprecated compatibility flag. Location inference is disabled by default.",
+    )
+    parser.add_argument(
+        "--infer-collision-frame-from-location",
+        action="store_true",
+        help="Infer collision frames from collision location messages when collision metadata is missing.",
     )
     parser.add_argument(
         "--max-collision-location-distance",
@@ -1534,7 +2065,7 @@ def main() -> int:
             args.pred_len,
             args.all_frames or not args.focus_frames_only,
             args.overwrite,
-            not args.no_infer_collision_frame_from_location,
+            args.infer_collision_frame_from_location and not args.no_infer_collision_frame_from_location,
             args.max_collision_location_distance,
             args.data_save_freq,
             args.sim_fps,
