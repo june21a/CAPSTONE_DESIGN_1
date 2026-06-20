@@ -15,11 +15,11 @@ export PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${SCENARIO_RUNNER_ROOT}:${LEADE
 CARLA_GARAGE_DIR="${CURRENT_DIR}/carla_garage"
 AGENT_CONFIG="/home/ec2-user/AD_challenge/experiments/pretrained_dynamic_plan_safety_head"
 AGENT="./team_code/comparison_agent.py"
-ROUTES="./leaderboard/data/bench2drive220_test_sample_55.xml"
-SAVE_PATH_DIR="./results/pretrained_dynamic_plan_safety_head_b2d55"
+ROUTES="./leaderboard/data/temp.xml"
+SAVE_PATH_DIR="./results/test_dynamic_short"
 CHECKPOINT="${SAVE_PATH_DIR}/debug_results.json"
 RESUME=1
-USE_HEURISTIC=1
+USE_HEURISTIC=0
 
 # ===== Environment Variables =====
 export DEBUG_CHALLENGE=1
@@ -30,6 +30,7 @@ export VISION_TASK_VIS=0
 export ATTENTION_SAVE_FREQ=1
 export DISABLE_CUDNN=0
 export FORCE_CPU=0
+export DATA_SAVE_FREQ=20
 
 # ===== Move Directory =====
 cd "${CARLA_GARAGE_DIR}" || exit

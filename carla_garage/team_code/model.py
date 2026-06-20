@@ -1360,19 +1360,60 @@ class DynamicPlanSafetyModePredictionHead(nn.Module):
     )
 
   @staticmethod
-  def _speed_rollout(ego_speed, target_speed, num_steps, rollout_dt, max_acceleration, max_deceleration):
+  def _velocity_rollout_distance_and_speed(ego_speed, target_speed, num_steps, rollout_dt, max_acceleration,
+                                           max_deceleration):
     speed = torch.clamp(ego_speed.reshape(-1), min=0.0)
     target_speed = torch.clamp(target_speed.reshape(-1), min=0.0)
+    distances = []
     speeds = []
+    distance = torch.zeros_like(speed)
     dt = max(float(rollout_dt), 1e-3)
     for _ in range(num_steps):
       delta_speed = target_speed - speed
       accel_step = max(0.0, float(max_acceleration)) * dt
       decel_step = max(0.0, float(max_deceleration)) * dt
-      speed = torch.where(delta_speed > 0.0, torch.minimum(speed + accel_step, target_speed),
-                          torch.maximum(speed - decel_step, target_speed))
+      next_speed = torch.where(delta_speed > 0.0, torch.minimum(speed + accel_step, target_speed),
+                               torch.maximum(speed - decel_step, target_speed))
+      distance = distance + 0.5 * (speed + next_speed) * dt
+      speed = next_speed
+      distances.append(distance)
       speeds.append(speed)
-    return torch.stack(speeds, dim=1)
+    return torch.stack(distances, dim=1), torch.stack(speeds, dim=1)
+
+  @staticmethod
+  def _interpolate_pose_along_waypoints(waypoints, rollout_distances):
+    num_steps = waypoints.shape[1]
+    if num_steps == 1:
+      return waypoints, torch.zeros_like(rollout_distances).unsqueeze(2)
+
+    segments = waypoints[:, 1:] - waypoints[:, :-1]
+    segment_lengths = torch.linalg.norm(segments, dim=2)
+    segment_yaws = torch.atan2(segments[:, :, 1], segments[:, :, 0])
+    valid_segments = segment_lengths > 1e-6
+    cumulative_distance = torch.cumsum(torch.where(valid_segments, segment_lengths, torch.zeros_like(segment_lengths)),
+                                       dim=1)
+    segment_start_distance = F.pad(cumulative_distance[:, :-1], (1, 0), value=0.0)
+    reaches_target = valid_segments.unsqueeze(1) & (cumulative_distance.unsqueeze(1) >= rollout_distances.unsqueeze(2))
+    has_reachable_segment = reaches_target.any(dim=2)
+    segment_index = reaches_target.to(torch.long).argmax(dim=2)
+
+    gather_index = segment_index.unsqueeze(2).expand(-1, -1, 2)
+    segment_start = torch.gather(waypoints[:, :-1], 1, gather_index)
+    segment = torch.gather(segments, 1, gather_index)
+    segment_yaw = torch.gather(segment_yaws, 1, segment_index)
+    segment_length = torch.gather(segment_lengths, 1, segment_index).clamp(min=1e-6)
+    start_distance = torch.gather(segment_start_distance, 1, segment_index)
+    ratio = ((rollout_distances - start_distance) / segment_length).clamp(min=0.0, max=1.0)
+    rollout_positions = segment_start + segment * ratio.unsqueeze(2)
+
+    final_positions = waypoints[:, -1:].expand(-1, num_steps, -1)
+    segment_indices = torch.arange(segments.shape[1], dtype=torch.long, device=waypoints.device).reshape(1, -1)
+    last_valid_index = torch.where(valid_segments, segment_indices, torch.full_like(segment_indices, -1)).max(dim=1).values
+    last_valid_index = last_valid_index.clamp(min=0)
+    final_yaw = torch.gather(segment_yaws, 1, last_valid_index.reshape(-1, 1)).expand(-1, num_steps)
+    rollout_positions = torch.where(has_reachable_segment.unsqueeze(2), rollout_positions, final_positions)
+    yaws = torch.where(has_reachable_segment, segment_yaw, final_yaw)
+    return rollout_positions, yaws.unsqueeze(2)
 
   def _make_ego_tokens(self, waypoints, target_speed, ego_speed, rollout_dt, max_acceleration, max_deceleration):
     if waypoints is None:
@@ -1383,13 +1424,14 @@ class DynamicPlanSafetyModePredictionHead(nn.Module):
     if waypoints.ndim != 3 or waypoints.shape[-1] != 2:
       raise ValueError(f'Expected waypoints with shape (B, T, 2), got {waypoints.shape}')
 
-    distances = torch.linalg.norm(waypoints, dim=2, keepdim=True)
     num_steps = waypoints.shape[1]
     t = torch.arange(1, num_steps + 1, dtype=waypoints.dtype, device=waypoints.device) * float(rollout_dt)
     t = t.reshape(1, num_steps, 1).repeat(waypoints.shape[0], 1, 1)
-    velocities = self._speed_rollout(ego_speed, target_speed, num_steps, rollout_dt, max_acceleration,
-                                     max_deceleration).unsqueeze(2)
-    return torch.cat((waypoints, distances, t, velocities), dim=2)
+    rollout_distances, velocities = self._velocity_rollout_distance_and_speed(ego_speed, target_speed, num_steps,
+                                                                              rollout_dt, max_acceleration,
+                                                                              max_deceleration)
+    rollout_positions, yaws = self._interpolate_pose_along_waypoints(waypoints, rollout_distances)
+    return torch.cat((rollout_positions, yaws, t, velocities.unsqueeze(2)), dim=2)
 
   def _bev_tokens(self, plan_safety_lidar_bev):
     if plan_safety_lidar_bev is None:
